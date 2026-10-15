@@ -1,0 +1,12 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "data_path": "Castlevania - Symphony of the Night/",
+        "data_slots": [
+            {
+                "id": 15,
+                "filename": "Castlevania - Symphony of the Night (Track 2).bin"
+            }
+        ]
+    }
+}

@@ -30,6 +30,12 @@ Tested on hardware: the game runs at full speed (60 fps), the opening movies (FM
 itself plays no CD audio: its music, very likely including the ending song, is XA-ADPCM; its track 2 is a spoken
 "this is a PlayStation disc" warning followed by music, for people who put the disc in a CD player.
 
+Branch `cd-audio`: CD audio tracks (CD-DA) are on again, for the BIOS CD player and SotN's track 2 (a spoken
+"this is a PlayStation disc" warning followed by music, for people who put the disc in a CD player); tested on
+hardware on its own (roadmap item 2). Build cc seed 1 has CD audio and the L2 / R2 combos together (to be tested
+on hardware). SotN itself plays no CD audio: its music, very likely including the ending song, is XA-ADPCM, which
+works in every build.
+
 Not supported:
 - Save states, memory card 2, EXE loading, LibCrypt, cheats, the newest CD Pause timing refinement (upstream `cd17b5a`).
 
