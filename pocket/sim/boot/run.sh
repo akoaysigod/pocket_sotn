@@ -63,9 +63,9 @@ nvc --std=2008 $L -a --relaxed $S/RamMLAB.vhd $S/RamM10Kn.vhd $S/dpram.vhd $S/Sy
    $S/gpu_videoout_sync.vhd $S/gpu_crosshair.vhd $S/justifier_sensor.vhd $S/gpu_videoout.vhd $S/gpu.vhd $S/irq.vhd \
    $S/pJoypad.vhd $S/joypad_pad.vhd $S/joypad_mem.vhd $S/joypad.vhd $S/timer.vhd $S/dma.vhd $S/exp2.vhd $S/pGTE.vhd \
    $S/gte_mac0.vhd $S/gte_mac123.vhd $S/gte_UNRDivide.vhd $S/pGTEs.vhd $S/gte_mac123s.vhd $S/gte.vhd $S/mdec.vhd \
-   $S/cd_xa_zigzag.vhd $S/cd_xa.vhd $S/cd_top.vhd $S/memctrl.vhd $S/sio.vhd $S/spu_ram.vhd $S/spu_gauss.vhd $S/spu.vhd \
+   $S/cd_xa_zigzag.vhd $S/cd_xa.vhd $S/cd_fw_pkg.vhd $S/cd_engine.vhd $S/cd_ctrl.vhd $S/cd_top.vhd $S/memctrl.vhd $S/sio.vhd $S/spu_ram.vhd $S/spu_gauss.vhd $S/spu.vhd \
    $S/datacache.vhd $S/cpu.vhd $S/memorymux.vhd $S/memcard.vhd $S/statemanager.vhd $S/savestates.vhd $S/psx_top.vhd \
    $S/psx_mister.vhd
 nvc --std=2008 $L -a --relaxed "$core/psram_async.vhd" "${VRAM_PSRAM:-$core/vram_psram.vhd}" "$core/psx_pocket_core.vhd" \
    "$here/../vram_psram/psram_model.vhd" "$here/ram_model.vhd" "$here/tb_boot.vhd"
-nvc --std=2008 --ieee-warnings=off $L -H 3g -e tb_boot -gRUN_MS=${1:-2000} -gDUMP_EVERY=${2:-20} -gDEBUG_SS=${DEBUG_SS:-0} -gTRACE_IO_N=${TRACE_IO_N:-0} -gTRACE_FROM_MS=${TRACE_FROM_MS:-0} -gFAST_SHELL=${FAST_SHELL:-false} -gSKIP_INTRO=${SKIP_INTRO:-false} -r
+nvc --std=2008 --ieee-warnings=off $L -H 3g -M 64m -e tb_boot -gRUN_MS=${1:-2000} -gDUMP_EVERY=${2:-20} -gDEBUG_SS=${DEBUG_SS:-0} -gTRACE_IO_N=${TRACE_IO_N:-0} -gTRACE_FROM_MS=${TRACE_FROM_MS:-0} -gFAST_SHELL=${FAST_SHELL:-false} -gSKIP_INTRO=${SKIP_INTRO:-false} -r

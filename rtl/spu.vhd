@@ -33,6 +33,8 @@ entity spu is
       
       sound_out_left       : out std_logic_vector(15 downto 0) := (others => '0');
       sound_out_right      : out std_logic_vector(15 downto 0) := (others => '0');
+      sound_valid          : out std_logic := '0';   -- Pocket: sound_out holds a new sample (one per sample, late if stashed)
+      late                 : out std_logic := '0';   -- Pocket: a sample starts late (the previous one is still processed)
       
       bus_addr             : in  unsigned(9 downto 0); 
       bus_dataWrite        : in  std_logic_vector(15 downto 0);
@@ -486,6 +488,17 @@ architecture arch of spu is
 
    -- cd processing
    signal cdProcStep             : integer range 0 to 4 := 4;
+   -- Pocket: CD input queue. cd_top updates cd_left / cd_right a few clocks after spu_tick; the SPU used to read them
+   -- at the end of its voice loop (and again for the capture buffer). When the SPU runs late (sound RAM slow: on the
+   -- Pocket its RAM shares the SDRAM with the CPU), that read came after the next update: the next CD sample, then
+   -- the same one again (a click in CD / XA music). Now each period's CD sample is queued 16 clocks after the tick and
+   -- taken at the end of the voice loop of the sample it belongs to; on time the same value as before.
+   type tcdq is array (0 to 3) of std_logic_vector(31 downto 0);
+   signal cdq                    : tcdq := (others => (others => '0'));
+   signal cdq_wp, cdq_rp         : unsigned(1 downto 0) := (others => '0');
+   signal cdq_n                  : integer range 0 to 4 := 0;
+   signal cd_use_left            : signed(15 downto 0) := (others => '0');
+   signal cd_use_right           : signed(15 downto 0) := (others => '0');
    signal cd_next_left           : signed(16 downto 0);
    signal cd_next_right          : signed(16 downto 0);
 
@@ -1006,6 +1019,11 @@ begin
             
             cd_next_left         <= (others => '0');
             cd_next_right        <= (others => '0');
+            cdq_wp               <= (others => '0');
+            cdq_rp               <= (others => '0');
+            cdq_n                <= 0;
+            cd_use_left          <= (others => '0');
+            cd_use_right         <= (others => '0');
                
             sampleticks          <= to_unsigned(512, 10); --unsigned(ss_in(1)(9 downto 0));
             
@@ -1545,12 +1563,23 @@ begin
             
             noiseCheck <= shift_right(to_unsigned(16#8000#, 16), to_integer(unsigned(cnt(13 downto 10)))) & x"0000";
             
+            late        <= '0';
+            sound_valid <= '0';
             if (sampleticks = 0 and state /= IDLE) then
+               late <= '1';
                if (stashedSamples < 15) then
                   stashedSamples    <= stashedSamples + 1;
                else
                   sound_timeout <= '1';
                end if;
+            end if;
+
+            -- CD input queue: this period's sample in (full: the oldest is dropped), taken at the end of the voice
+            -- loop below (empty: the last one is used again)
+            if (sampleticks = 16) then
+               cdq(to_integer(cdq_wp)) <= std_logic_vector(cd_left) & std_logic_vector(cd_right);
+               cdq_wp <= cdq_wp + 1;
+               if (cdq_n = 4) then cdq_rp <= cdq_rp + 1; else cdq_n <= cdq_n + 1; end if;
             end if;
             
             if (voiceCounter < 31) then
@@ -2045,6 +2074,12 @@ begin
                         
                         -- CD audio add
                         cdProcStep     <= 0;
+                        if (cdq_n > 0 and not (sampleticks = 16 and cdq_n = 4)) then
+                           cd_use_left  <= signed(cdq(to_integer(cdq_rp))(31 downto 16));
+                           cd_use_right <= signed(cdq(to_integer(cdq_rp))(15 downto 0));
+                           cdq_rp       <= cdq_rp + 1;
+                           if (sampleticks /= 16) then cdq_n <= cdq_n - 1; else cdq_n <= cdq_n; end if;
+                        end if;
                         if (cnt(0) = '1') then
                            soundleft      <= soundleft  + resize(cd_next_left, 24);
                            soundright     <= soundright + resize(cd_next_right,24);
@@ -2339,14 +2374,14 @@ begin
                   ram_request   <= '1';
                   ram_rnw       <= '0';
                   ram_Adr       <= "0000000" & "00" & std_logic_vector(capturePosition);
-                  ram_dataWrite <= std_logic_vector(cd_left);  
+                  ram_dataWrite <= std_logic_vector(cd_use_left);  
                   
                when CAPTURE1 =>
                   state <= CAPTURE2;
                   ram_request   <= '1';
                   ram_rnw       <= '0';
                   ram_Adr       <= "0000000" & "01" & std_logic_vector(capturePosition);
-                  ram_dataWrite <= std_logic_vector(cd_right); 
+                  ram_dataWrite <= std_logic_vector(cd_use_right); 
                   
                   -- noise
                   case (CNT(9 downto 8)) is
@@ -2400,11 +2435,11 @@ begin
             -- cd sound processing
             case (cdProcStep) is
                when 0 =>
-                  soundmul1 <= resize(cd_left, 24);
+                  soundmul1 <= resize(cd_use_left, 24);
                   soundmul2 <= signed(CDAUDIO_VOL_L);
                   
                when 1 =>
-                  soundmul1 <= resize(cd_right, 24);
+                  soundmul1 <= resize(cd_use_right, 24);
                   soundmul2 <= signed(CDAUDIO_VOL_R); 
                   
                when 2 =>
@@ -2440,6 +2475,7 @@ begin
                   elsif (soundmulresult15 > 32767) then sound_out_right <= x"7FFF";
                   else sound_out_right <= std_logic_vector(soundmulresult15(15 downto 0));
                   end if;
+                  sound_valid <= '1';
                
                when others => null;
             end case;

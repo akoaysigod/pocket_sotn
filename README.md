@@ -52,12 +52,14 @@ Pocket off before switching to another core.
 
 | Path | What |
 | --- | --- |
-| `rtl/` | the PSX core (MiSTer sources, trimmed). The build uses the 68 files listed in `pocket/src/fpga/psx_pocket.qip`; the others are upstream originals used by tests (e.g. `gte.vhd`, `savestates.vhd`) |
+| `rtl/` | the PSX core (MiSTer sources, trimmed). The build uses the 71 files listed in `pocket/src/fpga/psx_pocket.qip`; the others are upstream originals used by tests (e.g. `gte.vhd`, `savestates.vhd`) |
+| `rtl/cd_fw/` | firmware of the CD controller engine (`cd_fw.py`, assembled by `tools/cdasm.py` into `rtl/cd_fw_pkg.vhd`), see `docs/cd_engine.md` |
 | `pocket/src/fpga/` | Quartus project (`ap_core.qpf`), APF framework (`apf/`), Pocket wrapper (`core/`) |
 | `pocket/dist/` | Pocket JSON files (`Cores/akoaysigod.PSX`, `Platforms/psx.json`) |
 | `pocket/tools/` | `package.py` (SD card folders), `cue2instance.py` (game JSON), `rbf_reverse.py` |
 | `pocket/sim/`, `sim/` | simulation tests (nvc), see below |
-| `ref/upstream/rtl/` | upstream versions of `dma`, `spu`, `gpu`, `gpu_poly`, `gpu_line` (references for the tests) |
+| `ref/upstream/rtl/` | upstream versions of `dma`, `spu`, `gpu`, `gpu_poly`, `gpu_line`, `cd_top` (references for the tests) |
+| `ref/pocket/rtl/` | this core's `cd_top.vhd` before the CD engine (reference for `sim/cd_equiv`) |
 | `tools/` | build in Docker, seed search, timing reports |
 | `docs/` | `NIGHT_LOG.md` (every change, its test and its measurement, in order), SotN hardware usage, notes |
 
@@ -67,9 +69,9 @@ Main pieces of the Pocket wrapper (`pocket/src/fpga/core/`):
 | --- | --- |
 | Main RAM, BIOS, SPU RAM | SDRAM (`rtl/sdram.sv`, clk3x = 101.6 MHz) |
 | VRAM, memory card | both PSRAMs side by side as one 32-bit memory, synchronous burst mode (`vram_psram.vhd`) |
-| CD image | read sector by sector from the game's `.bin` files through APF data slots (`pocket_cd.vhd`) |
+| CD image | read from the game's `.bin` files through APF data slots, with read-ahead into an 8-sector ring (`pocket_cd.vhd`) |
 | Memory card file | APF save slot, loaded into / written back from PSRAM (`pocket_memcard.vhd`) |
-| Video, audio, controller | `pocket_video.vhd`, `sound_i2s.sv`, `pocket_psx.vhd`, `core_top.v` |
+| Video, audio, controller | `pocket_video.vhd`, `pocket_audio48.vhd` (44.1 kHz to the Pocket's 48 kHz; interpolation off by default for room, `AUDIO_INTERP` in `pocket_psx.vhd`), `sound_i2s.sv`, `pocket_psx.vhd`, `core_top.v` |
 
 ## Build
 
@@ -149,12 +151,18 @@ and `altera_mf.vhd` from a Quartus installation into a library named `altera_mf`
     ALTERA_MF_DIR=$PWD/sim/altera_lib sh sim/dma_equiv/run.sh 300000 1
     ALTERA_MF_DIR=$PWD/sim/altera_lib sh sim/spu_equiv/run.sh 2000000 1
     BIOS=$PWD/SCPH1001.BIN ALTERA_MF_DIR=$PWD/sim/altera_lib sh pocket/sim/boot/run.sh 400   # BIOS boot, ms
+    FREEZE=1 ALTERA_MF_DIR=$PWD/sim/altera_lib sh sim/cd_equiv/run.sh 1    # CD engine vs. the old controller
 
 Each `run.sh` has its usage on the first lines. `sim/`: equivalence of the trimmed modules (CD helpers, CPU
-multiplier, CD audio playback against upstream's `cd_top`, DMA, GPU dividers and VRAM, GTE, MDEC stub, memory
-card 2 removal, RAM primitives, reset-only save states, SPU). `pocket/sim/`: the Pocket wrapper (PSRAM controller
+multiplier, CD audio playback against upstream's `cd_top`, the CD controller engine against the controller it
+replaces (`sim/cd_equiv`: a disc model and a CPU model running boot, SotN-like loading with XA, CD audio and random
+command scripts; every output compared on every clock), DMA, GPU dividers and VRAM, GTE, MDEC stub, memory card 2
+removal, RAM primitives, reset-only save states, SPU). `pocket/sim/`: the Pocket wrapper (PSRAM controller
 with a PSRAM model, CD reader, memory card, L2 / R2 button combos,
-video, diagnostics page) and a full BIOS boot of the whole core.
+video, diagnostics page) and a full BIOS boot of the whole core (`pocket/sim/pocket_cd` also streams at double speed
+against slow SD card models: `LAT`, `NSTREAM`). `sim/spu_timing`: the SPU's time per sample against the sound RAM
+latency, and whether the CD sample it mixes is each period's own. `sim/audio48`: the 44.1 to 48 kHz converter against
+an ideal resample (input: 44.1 kHz samples as text, e.g. the game's music decoded offline).
 
 `sim/sdram` tests the SDRAM controller (`rtl/sdram.sv`, SystemVerilog) with [Verilator](https://verilator.org) 5 in
 Docker (the `mirlo-dev` image, or `VERILATOR_IMAGE`): it and a reference controller each get a behavioural SDRAM

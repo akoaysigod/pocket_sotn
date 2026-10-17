@@ -116,7 +116,8 @@ entity pocket_psx is
       video_skip         : out std_logic := '0';
       video_vs           : out std_logic := '0';
       video_hs           : out std_logic := '0';
-      -- audio (clk1x domain, signed)
+      -- audio: 48 kHz samples for sound_i2s (clk1x domain, signed), one per frame of its word clock audio_lrck
+      audio_lrck         : in  std_logic;
       sound_left         : out std_logic_vector(15 downto 0);
       sound_right        : out std_logic_vector(15 downto 0)
    );
@@ -152,6 +153,7 @@ architecture arch of pocket_psx is
    -- bring-up diagnostics (pocket_diag hex page, Select held): snapshots of the core's debug outputs
    -- (psx_top debug_out), refreshed every 2^24 clk1x (~0.5 s); 4 PC samples spread over that window
    constant DIAG_PAGE    : boolean := false;   -- hex diagnostics page while Select is held (bring-up builds)
+   constant AUDIO_INTERP : boolean := false;   -- 8-tap 44.1 -> 48 kHz interpolation (175 ALMs, 1 M10K, 1 DSP)
    constant DIAG_ROWS    : integer := 8;
    signal core_debug     : std_logic_vector(255 downto 0);
    signal dbg_tick       : unsigned(23 downto 0) := (others => '0');
@@ -159,6 +161,8 @@ architecture arch of pocket_psx is
    signal diag_wa        : std_logic_vector(2 downto 0) := (others => '0');
    signal diag_wd        : std_logic_vector(31 downto 0) := (others => '0');
    signal snd_l, snd_r   : std_logic_vector(15 downto 0);
+   signal snd_tick       : std_logic;
+   signal snd_valid      : std_logic;
    signal core_rgb       : std_logic_vector(23 downto 0);
    signal core_de, core_skip, core_vs, core_hs : std_logic;
 
@@ -369,7 +373,8 @@ begin
       KeyCircle => keys_pad(4), KeyCross => keys_pad(5), KeyTriangle => keys_pad(6), KeySquare => keys_pad(7),
       KeyL1 => keys_pad(8), KeyR1 => keys_pad(9), KeyL2 => keys_pad(10), KeyR2 => keys_pad(11),
       KeyL3 => keys_pad(12), KeyR3 => keys_pad(13), KeySelect => keys_pad(14), KeyStart => keys_pad(15),
-      sound_out_left => snd_l, sound_out_right => snd_r, debug_out => core_debug
+      sound_out_left => snd_l, sound_out_right => snd_r, sound_tick => snd_tick, sound_valid => snd_valid,
+      debug_out => core_debug
    );
 
    ram_addr    <= "00" & core_ram_Adr;
@@ -451,8 +456,15 @@ begin
    );
 
    ---------------------------------------------------------------- audio, bring-up diagnostics screen
-   sound_left  <= snd_l;
-   sound_right <= snd_r;
+   -- the SPU's samples in order on the 44.1 kHz grid (queue: the SPU may finish one late); with INTERP 44.1 kHz ->
+   -- 48 kHz interpolated as well (otherwise sound_i2s takes the newest sample at each frame, as before)
+   iaudio48 : entity work.pocket_audio48
+   generic map (INTERP => AUDIO_INTERP)
+   port map
+   (
+      clk => clk1x, tick => snd_tick, valid => snd_valid, in_l => snd_l, in_r => snd_r, lrck => audio_lrck,
+      out_l => sound_left, out_r => sound_right
+   );
 
    gdiag : if DIAG_PAGE generate
       -- snapshots for the diagnostics page (clk1x), written into pocket_diag's value RAM: row 1 = psx_top debug_out

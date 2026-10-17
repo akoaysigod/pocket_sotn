@@ -57,6 +57,7 @@ entity gpu is
       Gun2IRQ10            : out std_logic;
 	  
       cdSlow               : in  std_logic;
+      spuSlow              : in  std_logic := '0';
       
       errorOn              : in  std_logic;
       errorEna             : in  std_logic;
@@ -1959,6 +1960,7 @@ begin
       Gun2IRQ10                  => Gun2IRQ10,
             
       cdSlow                     => cdSlow,      
+      spuSlow                    => spuSlow,
                                  
       errorOn                    => errorOn,  
       errorEna                   => errorEna, 

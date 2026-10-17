@@ -6,9 +6,15 @@ use STD.textio.all;
 library mem;
 
 entity cd_top is
+   generic
+   (
+      SIM_FREEZE           : boolean := false   -- sim/cd_equiv: engine on clk_engine, eng_busy holds the testbench
+   );
    port 
    (
       clk1x                : in  std_logic;
+      clk_engine           : in  std_logic := '0';
+      eng_busy             : out std_logic;
       ce                   : in  std_logic;
       reset                : in  std_logic;
       
@@ -538,6 +544,19 @@ architecture arch of cd_top is
       return std_logic_vector(to_unsigned(t, 4)) & std_logic_vector(to_unsigned(v - t * 10, 4));
    end function;
 
+   -- cd_ctrl connections
+   signal nextSubdata_v   : std_logic_vector(95 downto 0);
+   signal ctrl_fetchIdle  : std_logic;
+   signal ctrl_sfetchIdle : std_logic;
+   signal ctrl_bufAhead   : std_logic;
+   signal ctrl_driveState : std_logic_vector(3 downto 0);
+   signal ctrl_cdda_out8  : std_logic;
+   signal ctrl_quiet      : std_logic;
+   signal irqPulse        : std_logic := '0';
+   signal irqHeld         : std_logic := '0';
+   signal irqFlagShown    : std_logic_vector(4 downto 0) := (others => '0');
+   signal irqFlagCPU      : std_logic_vector(4 downto 0);
+
    -- debug
    -- synthesis translate_off
    type tsectorBuffer is array(0 to 587) of std_logic_vector(31 downto 0);
@@ -626,7 +645,7 @@ begin
          elsif (ce = '1') then
          
             beginCommand      <= '0';
-            irqOut            <= '0';
+            irqPulse          <= '0';
             ackRead_valid     <= '0';
             ackPendingIRQ     <= '0';
             ackPendingSector  <= '0';
@@ -738,7 +757,7 @@ begin
                   
                   when x"3" =>
                      if (CDROM_STATUS(0) = '1') then
-                        bus_dataRead <= "111" & CDROM_IRQFLAG;
+                        bus_dataRead <= "111" & irqFlagCPU;
                      else
                         bus_dataRead <= "111" & CDROM_IRQENA;
                      end if;
@@ -761,7 +780,7 @@ begin
             if (cmdAck = '1' or cmdIRQ = '1') then
                CDROM_IRQFLAG <= "00011";
                if (CDROM_IRQENA(1 downto 0) /= "00") then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if;            
 
@@ -772,7 +791,7 @@ begin
                else
                   CDROM_IRQFLAG <= "00010";
                   if (CDROM_IRQENA(1) = '1') then
-                     irqOut <= '1';
+                     irqPulse <= '1';
                   end if;
                end if;
             end if;             
@@ -784,7 +803,7 @@ begin
                else
                   CDROM_IRQFLAG <= "00100";
                   if (CDROM_IRQENA(2) = '1') then
-                     irqOut <= '1';
+                     irqPulse <= '1';
                   end if;
                end if;
             end if;
@@ -804,20 +823,20 @@ begin
                CDROM_IRQFLAG   <= pendingDriveIRQ;
                pendingDriveIRQ <= (others => '0');
                if ((CDROM_IRQENA and pendingDriveIRQ) /= "00000") then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if;
             
             if (getIDAck = '1' and (hasCD = '0' or isAudioCD = '1')) then -- no async here, working will halt in case irq is still pending
                CDROM_IRQFLAG <= "00101";
                if (CDROM_IRQENA(0) = '1' or CDROM_IRQENA(2) = '1') then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if;
             if (getIDAck = '1' and (hasCD = '1' and isAudioCD = '0')) then -- no async here, working will halt in case irq is still pending
                CDROM_IRQFLAG <= "00010";
                if (CDROM_IRQENA(1) = '1') then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if;   
                
@@ -825,14 +844,14 @@ begin
                CDROM_IRQFLAG   <= "00101";
                pendingDriveIRQ <= (others => '0');
                if (CDROM_IRQENA(2) = '1' or CDROM_IRQENA(0) = '1') then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if; 
             
             if (CDDA_outcnt = 8) then
                CDROM_IRQFLAG <= "00001";
                if (CDROM_IRQENA(0) = '1') then
-                  irqOut <= '1';
+                  irqPulse <= '1';
                end if;
             end if;
             
@@ -886,835 +905,109 @@ begin
    ss_out(25)(20 downto 16)  <= lastreportCDDA;
    
    -- command processing
-   process(clk1x)
-      variable paramCountNew    : integer range 0 to 6;
-      variable applyNewcommand  : std_logic;
+   -- command processing and drive: cd_ctrl (small engine + per-clock fast path, docs/cd_engine.md)
+   nextSubdata_v <= nextSubdata(11) & nextSubdata(10) & nextSubdata(9) & nextSubdata(8) & nextSubdata(7) & nextSubdata(6) &
+                    nextSubdata(5) & nextSubdata(4) & nextSubdata(3) & nextSubdata(2) & nextSubdata(1) & nextSubdata(0);
+   ctrl_fetchIdle  <= '1' when (sectorFetchState = SFETCH_IDLE and readOnDisk_buffer = '0' and sectorProcessState = SPROC_IDLE and copyState = COPY_IDLE) else '0';
+   ctrl_sfetchIdle <= '1' when (sectorFetchState = SFETCH_IDLE) else '0';
+   ctrl_bufAhead   <= '1' when (sectorBufferSizes(to_integer(writeSectorPointer + 4)) /= 0) else '0';
+   driveState      <= tdrivestate'val(to_integer(unsigned(ctrl_driveState)));
+   CDDA_outcnt     <= 8 when ctrl_cdda_out8 = '1' else 0;
+
+   -- hardware: in the original an interrupt and its response bytes come one clock apart; here the bytes can come
+   -- an engine run (a few us) after the edge that raised the interrupt. So the CPU sees no new interrupt while
+   -- the engine is not quiet: the pulse to the interrupt controller waits, and the flag register reads its value of
+   -- the last quiet clock. In sim/cd_equiv (SIM_FREEZE) quiet is always '1': the original behaviour.
+   irqOut     <= (irqPulse or irqHeld) and ctrl_quiet;
+   irqFlagCPU <= CDROM_IRQFLAG when ctrl_quiet = '1' else irqFlagShown;
+   process (clk1x)
    begin
       if (rising_edge(clk1x)) then
-         
-         FifoResponse_reset      <= '0';
-         FifoResponse_Wr         <= '0';
-         FifoParam_Rd            <= '0';
-         FifoParam_reset         <= '0';
-         
-         cmdResetXa              <= '0';
-      
-         if (reset = '1') then
-            
-            FifoParam_reset         <= '1';
-            FifoResponse_reset      <= '1';
-            cmdPending              <= ss_in(18)(1); -- '0'
-            cmd_busy                <= ss_in(18)(0); -- '0'
-            cmd_delay               <= to_integer(unsigned(ss_in(12)(16 downto 0))); -- 0
-            nextCmd                 <= ss_in(13)(23 downto 16); -- '0';
-            fifoParamCount          <= 0;
-            working                 <= ss_in(18)(2); -- '0'
-            workDelay               <= to_integer(unsigned(ss_in(0)(31 downto 0))); -- 0
-            workCommand             <= ss_in(14)(15 downto 8);
-               
-            muted                   <= ss_in(18)(7); -- '0'
-            
-            setLocActive            <= ss_in(18)(3); -- '0'
-            setLocMinute            <= unsigned(ss_in(14)(23 downto 16));
-            setLocSecond            <= unsigned(ss_in(14)(31 downto 24));
-            setLocFrame             <= unsigned(ss_in(15)(7 downto 0));
-            
-            session                 <= ss_in(17)(7 downto 0); -- 0
-            fastForwardRate         <= signed(ss_in(15)(23 downto 16)); -- 0
-            
-            XaFilterFile            <= ss_in(16)(23 downto 16);
-            XaFilterChannel         <= ss_in(16)(31 downto 24);
-            
-            lastreportCDDA          <= ss_in(25)(20 downto 16); -- x"1F";
-            CDDA_outcnt             <= 0;
-            
-         elsif (ce = '1') then
-         
-            handleCommand           <= '0';
-            cmdAck                  <= '0';
-            cmdIRQ                  <= '0';
-            driveAck                <= '0';
-            getIDAck                <= '0';
-            softReset               <= '0';
-            seekOnDiskCmd           <= '0';
-            stop_afterseek          <= '0';
-            setMode                 <= '0';
-            readSN                  <= '0';
-            play                    <= '0';
-            setSession              <= '0';
-            cmdStartMotor           <= '0';
-            cmdStop                 <= '0';
-            drive_stop              <= '0';
-            startMotorCMD           <= '0';
-            shell_close             <= '0';
-            errorResponseCmd_new    <= '0';
-            errorResponseNext_new   <= '0';
-            ClearXACurrentSet       <= '0';
-            updatePhysicalPosition  <= '0';
-         
-            -- receive new command request or decrease wait timer on pending command
-            if (beginCommand = '1') then
-            
-               case (newCmd) is
-                  when x"02"  => paramCountNew := 3; --Setloc
-                  when x"0D"  => paramCountNew := 2; --SetFilter
-                  when x"0E"  => paramCountNew := 1; --Setmode
-                  when x"12"  => paramCountNew := 1; --SetSession
-                  when x"14"  => paramCountNew := 1; --GetTD
-                  when x"19"  => paramCountNew := 1; --Test
-                  when x"1D"  => paramCountNew := 2; --GetQ
-                  when x"1F"  => paramCountNew := 6; --VideoCD
-                  when others => paramCountNew := 0;
-               end case;
-               
-               -- if a second command is executed when a first is still pending depends on which commands they are according to duckstation
-               -- so we use the heuristic from duckstation and extend it by the exceptions that don't work in duckstation
-               -- until a better solution is found               
-               applyNewcommand := '1';
-               
-               if (cmdPending = '1') then
-                  if (newCmd = x"0E" and nextCmd = x"02") then applyNewcommand := '0'; end if; -- happens in "reel fishing" startup -> ignore second command
-               end if;
-               
-               if (applyNewcommand = '1') then
-                  
-                  if (cmdPending = '1' and paramCount > paramCountNew) then
-                     FifoParam_reset <= '1';
-                  end if;
-                  
-                  working <= '0'; -- second response from reset will interfere with command (e.g. wipeout xl)
-               
-                  cmdPending <= '1';
-                  cmd_busy   <= '1';
-                  if (driveState = DRIVE_OPENING) then
-                     cmd_delay  <= 15000 - 2;
-                  else
-                     cmd_delay  <= 25000 - 2;
-                  end if;
-                  if (newCmd = x"1C") then -- init
-                     cmd_delay <= 120000 - 2;
-                  end if;
-      
-                  nextCmd    <= newCmd;
-                  paramCount <= paramCountNew;
-                  
-                  if (driveState = DRIVE_IDLE and internalStatus(1) = '1' and newCmd = x"11") then
-                     updatePhysicalPosition <= '1';
-                  end if;
-                  
-               end if;
-         
-            elsif (cmd_busy = '1') then
-               if (CDROM_IRQFLAG /= "00000" or dma_read = '1') then
-                  if (cmd_delay < 8192) then
-                     cmd_delay <= 8192;
-                  end if;
-               else
-                  if (cmd_delay > 0) then
-                     if (cmd_delay < 16 or ((driveBusy = '0' or driveDelay > 100) and (working = '0' or workDelay > 100))) then
-                        cmd_delay <= cmd_delay - 1;
-                     end if;
-                  else
-                     handleCommand <= '1';
-                     cmd_busy      <= '0';
-                  end if;
-               end if;
-            end if;
-            
-            -- command processing time is up -> handle it
-            if (handleCommand = '1') then
-               if (fifoParamCount < paramCount) then
-                  errorResponseCmd_new    <= '1';
-                  errorResponseCmd_error  <= x"01";
-                  errorResponseCmd_reason <= x"20";
-                  cmdPending              <= '0';
-                  FifoParam_reset         <= '1';
-               else
-               
-                  if (FifoResponse_empty = '0' and nextCmd /= x"0F" and nextCmd /= x"10" and nextCmd /= x"11" and nextCmd /= x"13" and nextCmd /= x"14" and nextCmd /= x"19") then
-                     FifoResponse_reset <= '1';
-                  end if;
-                  
-                  if (nextCmd /= x"02" and nextCmd /= x"0D") then
-                     FifoParam_reset <= '1';
-                  end if;
-                  
-                  case (nextCmd) is
-                     when x"00" => -- Sync
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                        cmdPending <= '0';
-                        
-                     when x"01" => -- Getstat
-                        cmdAck         <= '1';
-                        cmdPending     <= '0';
-                        if (hasCD = '1' and driveState /= DRIVE_OPENING) then
-                           shell_close <= '1';
-                        end if;
-                        
-                     when x"02" => -- Setloc
-                        setLocReadStep <= 5;
-                        setLocActive   <= '1';
-                        cmdAck         <= '1';
-                        cmdPending     <= '0';
-                        
-                     when x"03" => -- play
-                        cmdPending <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                        
-                           playTrack <= '0';
-                           nextTrack <= x"00";
-                           if (FifoParam_Empty = '0') then
-                              playLBA   <= to_integer(unsigned(trackInfo_DataOutA(18 downto 0))) + PREGAPSIZE;
-                              playTrack <= '1';
-                              nextTrack <= FifoParam_Dout;
-                           end if;
-                           
-                           --playLBA   <= to_integer(unsigned(trackInfo_DataOutA(18 downto 0))) + PREGAPSIZE; -- debug test!
-                           --playTrack <= '1'; -- debug test!
-                           
-                           cmdAck          <= '1';
-                           fastForwardRate <= (others => '0');
-                           
-                           --fastForwardRate <= to_signed(-4, 8); -- debug test!
-                           
-                           if ((FifoParam_Empty = '1' or FifoParam_Dout = x"00") and (setLocActive = '0' or seekLBA = lastReadSector) and (driveState = DRIVE_PLAYING or ((driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) and playAfterSeek = '1'))) then
-                              playLBA <= currentLBA;
-                           else
-                              play           <= '1';
-                              lastreportCDDA <= (others => '1');
-							  if (FifoParam_Empty = '1' or FifoParam_Dout = x"00") then
-							     playLBA <= currentLBA;
-                              end if;
-                           end if; 
-                        end if;
-                        
-                     when x"04" => -- forward
-                        if (driveState /= DRIVE_PLAYING) then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           if (fastForwardRate < 0) then
-                              fastForwardRate <= to_signed(4, 8);
-                           elsif (fastForwardRate < 12) then
-                              fastForwardRate <= fastForwardRate + 4;
-                           end if;
-                           cmdAck      <= '1';
-                           cmdPending  <= '0';
-                        end if;
-                        
-                     when x"05" => -- backward
-                        if (driveState /= DRIVE_PLAYING) then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           if (fastForwardRate > 0) then
-                              fastForwardRate <= to_signed(-4, 8);
-                           elsif (fastForwardRate > -12) then
-                              fastForwardRate <= fastForwardRate - 4;
-                           end if;
-                           cmdAck      <= '1';
-                           cmdPending  <= '0';
-                        end if;
-                        
-                     --when "06" => readN at readS 0x1B
-                     
-                     when x"07" => -- MotorOn
-                        cmdPending  <= '0';
-                        if (internalStatus(1) = '1') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"20";
-                        else
-                           cmdAck      <= '1';
-                           if (working = '0') then
-                              working     <= '1';
-                              workDelay   <= 400000 - 2;
-                              workCommand <= nextCmd;
-                              if (hasCD = '1') then
-                                 cmdStartMotor <= '1';
-                              end if;
-                           end if;
-                        end if;
-                        
-                     when x"08" => -- Stop
-                        cmdAck      <= '1';
-                        cmdPending  <= '0';
-                        if (internalStatus(1) = '1') then
-                           if (modeReg(7) = '1') then
-                              workDelay   <= 25000000 - 2;
-                           else
-                              workDelay   <= 13000000 - 2;
-                           end if;
-                        else
-                           workDelay   <= 7000 - 2;
-                        end if;
-                        working     <= '1';
-                        workCommand <= nextCmd;
-                        cmdStop     <= '1';
-                        
-                     when x"09" => -- pause
-                        -- Reject pause while seeking (SeekL/SeekP) or while reading/playing before the first sector has been processed (verified on real hardware).
-                        if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or
-                            ((driveState = DRIVE_READING or driveState = DRIVE_PLAYING) and internalStatus(6) = '1')) then
-                           cmdPending              <= '0';
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01"; -- STAT_ERROR
-                           errorResponseCmd_reason <= x"80"; -- NOT_READY
-                           if (readAfterSeek = '1') then
-                              stop_afterseek <= '1';
-                           end if;
-                        else
-                           cmdAck      <= '1';
-                           cmdPending  <= '0';
-                           working     <= '1';
-                           workDelay   <= 7000 - 2;
-                           workCommand <= nextCmd;
-                           cmdResetXa  <= '1';
-
-                           -- Pocket: fixed Pause time as before upstream commit cd17b5a (its disc rotation model,
-                           -- a 27-bit delay calculation and a multiply, is left out for area)
-                           if (driveState = DRIVE_READING or driveState = DRIVE_PLAYING) then
-                              if (modeReg(7) = '1') then
-                                 workDelay  <= 1066874 + driveDelay; -- value from psx spx doc
-                              else
-                                 workDelay  <= 2157295 + driveDelay; -- value from psx spx doc
-                              end if;
-                           end if;
-                           drive_stop <= '1';
-                        end if;
-
-                     when x"0A" => -- reset
-                        if (working = '1' and workCommand = x"0A") then
-                           cmdPending <= '0';
-                        else
-                           --todo
-                           --if (driveState == DRIVESTATE::SEEKLOGICAL || driveState == DRIVESTATE::SEEKPHYSICAL || driveState == DRIVESTATE::SEEKIMPLICIT)
-                           --{
-                           --   updatePositionWhileSeeking();
-                           --}
-                           cmdAck      <= '1';
-                           softReset   <= '1';
-                           working     <= '1';
-						   -- cannot ignore old workdelay, otherwise reset after pause is too fast(e.g. GTA PAL)
-						   -- increased 399999->3999999 (~12ms->~118ms, = DuckStation INIT_TICKS) to fix Virtual Pool 3 and the logo intro in Disruptor
-                           workDelay   <= workDelay + 3999999;
-                           workCommand <= nextCmd;
-                           -- call here second time, so response has new values after reset?
-                           cmd_delay   <= 24999 - 2;
-                           cmd_busy    <= '1';
-                        end if;
-                     
-                     when x"0B" => -- mute
-                        muted       <= '1';
-                        cmdAck      <= '1';
-                        cmdPending  <= '0';
-                        
-                     when x"0C" => -- demute
-                        muted       <= '0';
-                        cmdAck      <= '1';
-                        cmdPending  <= '0';
-                        
-                     when x"0D" => -- setfilter
-                        setFilterReadStep <= 3;
-                        ClearXACurrentSet <= '1';
-                        cmdAck            <= '1';
-                        cmdPending        <= '0';
-                        
-                     when x"0E" => -- setmode
-                        setMode      <= '1';
-                        newMode      <= FifoParam_Dout;
-                        cmdAck       <= '1';
-                        cmdPending   <= '0';
-                     
-                     when x"0F" => -- getparam
-                        cmdPending  <= '0';
-                        cmdIRQ      <= '1';
-                        
-                     when x"10" => -- GetLocL
-                        cmdPending        <= '0';
-                        if (lastSectorHeaderValid = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           -- todo: update position?
-                           cmdIRQ            <= '1';
-                        end if;
-                        
-                     when x"11" => -- GetLocP
-                        cmdPending        <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           -- todo: update position?
-                           cmdIRQ            <= '1';
-                        end if;
-                        
-                     when x"12" => -- SetSession
-                        cmdPending     <= '0';
-                        if (hasCD = '0' or driveState = DRIVE_READING or driveState = DRIVE_PLAYING) then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           session    <= FifoParam_Dout;
-                           setSession <= '1';
-                           cmdAck     <= '1';
-                        end if;
-                        
-                     when x"13" => -- GetTN
-                        cmdPending     <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           cmdIRQ         <= '1';
-                        end if;
-                        
-                     when x"14" => -- GetTD
-                        cmdPending   <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        elsif (unsigned(FifoParam_Dout) > unsigned(trackcountBCD)) then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"10";
-                        else
-                           cmdIRQ         <= '1';
-                        end if;
-                        
-                     when x"15" | x"16" => -- SeekL/SeekP
-                        --todo: if seeking, update position?
-                        cmdAck                <= '1';
-                        cmdPending            <= '0';
-                        seekOnDiskCmd         <= '1';
-                        setLocActive          <= '0';
-                        cmdResetXa            <= '1';
-                        
-                     when x"17" | x"18" => -- SetClock/GetClock
-                        cmdPending <= '0';
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                        
-                     when x"19" => -- test
-                        cmdPending     <= '0';
-                        if (FifoParam_Dout = x"04" or FifoParam_Dout = x"05" or FifoParam_Dout = x"20" or FifoParam_Dout = x"22") then
-                           cmdIRQ <= '1';
-                        else
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"40";
-                        end if;
-                        
-                     when x"1A" => -- getID
-                        cmdPending     <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           cmdAck      <= '1';
-                           working     <= '1';
-                           workDelay   <= 33867 - 2;
-                           workCommand <= nextCmd;
-                           -- if (driveState == DRIVESTATE::SPINNINGUP && driveBusy) workDelay += driveDelay; -- todo: required?
-                        end if;
-                        
-                     when x"06" | x"1B" => -- ReadN/ReadS
-                        cmdPending <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        elsif (isAudioCD = '1' and modeReg(0) = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"40";
-                        else
-                           -- todo: missing checks
-                           cmdAck <= '1';
-                           
-                           if ((setLocActive = '0' or seekLBA = lastReadSector) and (driveState = DRIVE_READING or ((driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) and readAfterSeek = '1'))) then
-                              setLocActive <= '0';
-                           else
-                              readSN <= '1';
-                           end if;
-                        end if;
-                        
-                     when x"1C" => -- Init
-                        cmdPending <= '0';
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                        
-                     when x"1D" => -- GetQ
-                        cmdPending <= '0';
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                        
-                     when x"1E" => -- ReadTOC
-                        cmdPending <= '0';
-                        if (hasCD = '0') then
-                           errorResponseCmd_new    <= '1';
-                           errorResponseCmd_error  <= x"01";
-                           errorResponseCmd_reason <= x"80";
-                        else
-                           cmdAck      <= '1';
-                           working     <= '1';
-                           workDelay   <= 16934400 - 2;
-                           workCommand <= nextCmd;
-                        end if;
-                     
-                     when x"1F" => -- VideoCD
-                        cmdPending <= '0';
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                     
-                     when others =>
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
-                        cmdPending <= '0';
-                        
-                  end case;
-                  
-               end if;
-            elsif (working = '1') then -- second processing of recurring commands
-               if (workDelay > 0) then
-                  workDelay <= workDelay - 1;
-                  if (workCommand = x"1A") then -- GetID
-                     -- todo: do region check here...but why?
-                     if (workDelay = 10) then FifoResponse_reset <= '1'; end if; 
-                     if (workDelay = 9) then 
-                        FifoResponse_Wr <= '1'; 
-                        FifoResponse_Din <= internalStatus; 
-                        if (hasCD = '0')     then FifoResponse_Din(3) <= '1'; end if; 
-                        if (hasCD = '1')     then FifoResponse_Din(1) <= '1'; end if; -- from start motor
-                        if (isAudioCD = '1') then FifoResponse_Din(3) <= '1'; end if; 
-                     end if;
-                     if (workDelay = 8) then
-                        FifoResponse_Wr <= '1'; 
-                        FifoResponse_Din <= x"00";
-                        if (hasCD = '0')     then FifoResponse_Din(6) <= '1'; end if; 
-                        if (isAudioCD = '1') then FifoResponse_Din(7) <= '1'; FifoResponse_Din(4) <= '1'; end if; 
-                     end if;
-                     if (workDelay = 7) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"20"; end if; -- ? 
-                     if (workDelay = 6) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"00"; end if; -- ? 
-                     if (workDelay = 5) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('S')), 8)); end if;
-                     if (workDelay = 4) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('C')), 8)); end if; 
-                     if (workDelay = 3) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('E')), 8)); end if; 
-                     if (region = "00") then -- ntsc-u
-                        if (workDelay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('A')), 8)); end if; 
-                     elsif (region = "01") then -- ntsc-j
-                        if (workDelay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('I')), 8)); end if; 
-                     elsif (region = "10") then -- pal
-                        if (workDelay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('E')), 8)); end if; 
-                     end if;
-                  end if;
-               else
-                  working <= '0';
-                  if (workCommand = x"1A") then -- GetID
-                     if (hasCD = '1') then
-                        startMotorCMD <= '1';
-                     end if;
-                     getIDAck <= '1';
-                  else
-                     driveAck <= '1';
-                  end if;
-               end if;
-            elsif (workDelay > 0) then 
-               workDelay <= workDelay - 1;
-            end if;
-            
-            -- don't end work command if last command isn't processed
-            if (workDelay = 11 and CDROM_IRQFLAG /= "00000") then workDelay <= 11; end if; 
-            
-            if (seekOnDiskCmd = '1' or seekOnDiskDrive = '1') then
-               setLocActive <= '0';
-            end if;
-            
-            -- processing of commands that take several parameters
-            
-            -- setLoc
-            if (setLocReadStep > 0) then
-               setLocReadStep <= setLocReadStep - 1;
-               case (setLocReadStep) is
-                  when 5 => 
-                     setLocMinute <= unsigned(FifoParam_Dout(7 downto 4)) * 10 + unsigned(FifoParam_Dout(3 downto 0));
-                     FifoParam_Rd <= '1';
-                  when 3 => 
-                     setLocSecond <= unsigned(FifoParam_Dout(7 downto 4)) * 10 + unsigned(FifoParam_Dout(3 downto 0));
-                     FifoParam_Rd <= '1';
-                  when 1 => 
-                     setLocFrame     <= unsigned(FifoParam_Dout(7 downto 4)) * 10 + unsigned(FifoParam_Dout(3 downto 0));
-                     FifoParam_reset <= '1';
-                  when others => null;
-               end case;
-            end if;
-            
-            -- setFilter
-            if (setFilterReadStep > 0) then
-               setFilterReadStep <= setFilterReadStep - 1;
-               case (setFilterReadStep) is
-                  when 3 => 
-                     XaFilterFile <= FifoParam_Dout;
-                     FifoParam_Rd <= '1';
-                  when 1 => 
-                     XaFilterChannel <= FifoParam_Dout;
-                     FifoParam_reset <= '1';
-                  when others => null;
-               end case;
-            end if;
-            
-            -- responses
-            if (cmdAck = '1' or ackRead_valid = '1') then
-               FifoResponse_Din <= internalStatus;
-               FifoResponse_Wr  <= '1';
-            end if;
-            
-            if (driveAck = '1' or ackDrive = '1' or ackDriveEnd = '1') then
-               if (CDROM_IRQFLAG = "00000") then
-                  if (ackDriveEnd = '1') then
-                     FifoResponse_Din <= internalStatus_1;
-                  else
-                     FifoResponse_Din <= internalStatus;
-                  end if;
-                  FifoResponse_Wr  <= '1';
-               end if;
-            end if;
-                      
-            if (errorResponseCmd_new = '1') then
-               FifoResponse_Din           <= internalStatus or errorResponseCmd_error;
-               FifoResponse_Wr            <= '1';
-               errorResponseNext_new      <= '1';
-               errorResponseNext_reason   <= errorResponseCmd_reason;
-            end if;      
-            if (errorResponseDrive_new = '1') then
-               FifoResponse_Din        <= internalStatus or errorResponseDrive_error;
-               FifoResponse_Wr         <= '1';
-               errorResponseNext_new   <= '1';
-               errorResponseNext_reason   <= errorResponseDrive_reason;
-            end if;   
-            if (errorResponseNext_new = '1') then
-               FifoResponse_Din        <= errorResponseNext_reason;
-               FifoResponse_Wr         <= '1';
-            end if; 
-
-            ackPendingIRQNext <= ackPendingIRQ;
-            if (ackPendingIRQ = '1') then
-               FifoResponse_reset <= '1';
-            end if;
-            if (ackPendingIRQNext = '1') then
-               FifoResponse_Din  <= pendingDriveResponse;
-               FifoResponse_Wr   <= '1';
-            end if;
-            
-            -- long getparam response
-            if (nextCmd = x"0F") then
-               if (cmd_delay = 6 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-               if (cmd_delay = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-               if (cmd_delay = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= modeReg; end if;
-               if (cmd_delay = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"00"; end if;
-               if (cmd_delay = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= XaFilterFile; end if;
-               if (cmd_delay = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= XaFilterChannel; end if;
-            end if;
-            
-            -- long GetLocL response
-            if (nextCmd = x"10") then
-               if (cmd_delay = 9 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-               if (cmd_delay = 8 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= header( 7 downto  0); end if;
-               if (cmd_delay = 7 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= header(15 downto  8); end if;
-               if (cmd_delay = 6 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= header(23 downto 16); end if;
-               if (cmd_delay = 5 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= header(31 downto 24); end if;
-               if (cmd_delay = 4 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subheader( 7 downto  0); end if;
-               if (cmd_delay = 3 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subheader(15 downto  8); end if;
-               if (cmd_delay = 2 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subheader(23 downto 16); end if;
-               if (cmd_delay = 1 and lastSectorHeaderValid = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subheader(31 downto 24); end if;
-            end if;
-            
-            -- long GetLocP response
-            if (nextCmd = x"11") then
-               if (cmd_delay = 9 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-               if (cmd_delay = 8 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(1); end if;
-               if (cmd_delay = 7 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(2); end if;
-               if (cmd_delay = 6 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(3); end if;
-               if (cmd_delay = 5 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(4); end if;
-               if (cmd_delay = 4 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(5); end if;
-               if (cmd_delay = 3 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(7); end if;
-               if (cmd_delay = 2 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(8); end if;
-               if (cmd_delay = 1 and hasCD = '1')  then FifoResponse_Wr <= '1'; FifoResponse_Din <= subdata(9); end if;
-            end if;
-            
-            -- long GetTN response
-            if (nextCmd = x"13") then
-               if (cmd_delay = 4 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-               if (cmd_delay = 3 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-               if (cmd_delay = 2 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"01"; end if; -- todo:  first track number always 1?
-               if (cmd_delay = 1 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= trackcountBCD; end if;
-            end if;
-            
-            -- long GetTD response
-            
-            if (nextCmd = x"14") then
-               if (cmd_delay = 4 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-               if (FifoParam_Dout = x"00") then -- track 0 -> total size of CD
-                  if (cmd_delay = 3 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-                  if (cmd_delay = 2 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= totalMinutesBCD; end if;
-                  if (cmd_delay = 1 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= totalSecondsBCD; end if;
-               elsif (FifoParam_Dout <= trackcountBCD) then
-                  if (cmd_delay = 3 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-                  if (cmd_delay = 2 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= minutesBCD; end if;
-                  if (cmd_delay = 1 and hasCD = '1') then FifoResponse_Wr <= '1'; FifoResponse_Din <= secondsBCD; end if;
-               end if;
-            end if;
-
-            -- long test response
-            if (nextCmd = x"19") then
-               if (cmd_delay = 11 and FifoResponse_empty = '0') then 
-                  FifoResponse_reset <= '1'; 
-               end if;
-                    
-               case (FifoParam_Dout) is
-                  when x"04" => -- Reset SCEx counters
-                     if (cmd_delay = 1) then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; startMotorCMD <= '1'; end if;
-               
-                  when x"05" => -- Read SCEx counters
-                     if (cmd_delay = 3) then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-                     if (cmd_delay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"00"; end if; -- ?
-                     if (cmd_delay = 1) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"00"; end if; -- ?
-                  
-                  when x"20" => -- Get CDROM BIOS Date/Version
-                     if (cmd_delay = 4) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"95"; end if;
-                     if (cmd_delay = 3) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"05"; end if;
-                     if (cmd_delay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"16"; end if;
-                     if (cmd_delay = 1) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"C1"; end if;
-                  
-                  when x"22" => -- region
-                     if (region = "00") then -- ntsc-u
-                        if (cmd_delay = 7)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('f')), 8)); end if;
-                        if (cmd_delay = 6)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('o')), 8)); end if;
-                        if (cmd_delay = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('r')), 8)); end if;
-                        if (cmd_delay = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos(' ')), 8)); end if;
-                        if (cmd_delay = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('U')), 8)); end if;
-                        if (cmd_delay = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('/')), 8)); end if;
-                        if (cmd_delay = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('C')), 8)); end if;
-                     elsif (region = "01") then -- ntsc-j
-                        if (cmd_delay = 9)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('f')), 8)); end if;
-                        if (cmd_delay = 8)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('o')), 8)); end if;
-                        if (cmd_delay = 7)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('r')), 8)); end if;
-                        if (cmd_delay = 6)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos(' ')), 8)); end if;
-                        if (cmd_delay = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('J')), 8)); end if;
-                        if (cmd_delay = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('a')), 8)); end if;
-                        if (cmd_delay = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('p')), 8)); end if;
-                        if (cmd_delay = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('a')), 8)); end if;
-                        if (cmd_delay = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('n')), 8)); end if;
-                     elsif (region = "10") then -- pal
-                        if (cmd_delay = 10) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('f')), 8)); end if;
-                        if (cmd_delay = 9)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('o')), 8)); end if;
-                        if (cmd_delay = 8)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('r')), 8)); end if;
-                        if (cmd_delay = 7)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos(' ')), 8)); end if;
-                        if (cmd_delay = 6)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('E')), 8)); end if;
-                        if (cmd_delay = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('u')), 8)); end if;
-                        if (cmd_delay = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('r')), 8)); end if;
-                        if (cmd_delay = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('o')), 8)); end if;
-                        if (cmd_delay = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('p')), 8)); end if;
-                        if (cmd_delay = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('e')), 8)); end if;
-                     end if;
-               
-                  when others => null;
-               end case;
-            end if;
-            
-            -- CDDA reporting
-            if (CDDA_ON and processCDDASector = '1' and driveState = DRIVE_PLAYING and modeReg(2) = '1' and lastreportCDDA /= '0' & nextSubdata(9)(7 downto 4)) then
-               lastreportCDDA     <= '0' & nextSubdata(9)(7 downto 4);
-               -- don't return CDDA response if a command is currently in process or response is still pending
-               -- latching it and respond later when irq and response have been processed is not possible or too late, so rather drop it
-               if (CDDA_outcnt = 0 and CDROM_IRQFLAG = "00000" and FifoResponse_Empty = '1' and handleCommand = '0' and cmd_busy = '0') then
-                  CDDA_outcnt        <= 8;
-                  FifoResponse_reset <= '1';
-               end if;
-            end if;
-            
-            -- CDDA_outcnt is only set by CD-DA playback (processCDDASector), so with CDDA_ON = false it stays 0
-            if (CDDA_ON and CDDA_outcnt > 0) then
-               CDDA_outcnt <= CDDA_outcnt - 1;
-               if (CDDA_outcnt = 8)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= internalStatus; end if;
-               if (CDDA_outcnt = 7)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(1); end if;
-               if (CDDA_outcnt = 6)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(2); end if;
-               if (nextSubdata(9)(4) = '1') then
-                  if (CDDA_outcnt = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(3); end if;
-                  if (CDDA_outcnt = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"80" or nextSubdata(4); end if;
-                  if (CDDA_outcnt = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(5); end if;
-               else
-                  if (CDDA_outcnt = 5)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(7); end if;
-                  if (CDDA_outcnt = 4)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(8); end if;
-                  if (CDDA_outcnt = 3)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= nextSubdata(9); end if;
-               end if;
-               if (nextSubdata(8)(0) = '1') then
-                  if (CDDA_outcnt = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(peakvolumeR(7 downto 0)); end if;
-                  if (CDDA_outcnt = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= '1' & std_logic_vector(peakvolumeR(14 downto 8)); end if;
-               else
-                  if (CDDA_outcnt = 2)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(peakvolumeL(7 downto 0)); end if;
-                  if (CDDA_outcnt = 1)  then FifoResponse_Wr <= '1'; FifoResponse_Din <= '0' & std_logic_vector(peakvolumeL(14 downto 8)); end if;
-               end if;
-            end if;
-            
-            if (newCD = '1' and newCD_1 = '0') then
-               FifoResponse_reset <= '1';
-               cmdPending         <= '0';
-               cmd_busy           <= '0';
-               cmd_delay          <= 0;
-            end if;
-            
-            if (softReset = '1') then
-               FifoParam_reset <= '1';
-            end if;
-         
-         end if; -- ce
-         
-         if (FifoParam_reset = '1') then
-            fifoParamCount <= 0;
-         elsif (FifoParam_Wr = '1') then
-            -- synthesis translate_off
-            if (fifoParamCount < 16) then
-            -- synthesis translate_on
-               fifoParamCount <= fifoParamCount + 1;
-            -- synthesis translate_off
-            end if;
-            -- synthesis translate_on
-         elsif (FifoParam_Rd = '1') then
-            fifoParamCount <= fifoParamCount - 1; 
+         if (ctrl_quiet = '1') then
+            irqFlagShown <= CDROM_IRQFLAG;
          end if;
-          
+         if (reset = '1') then
+            irqHeld <= '0';
+         elsif (ce = '1') then
+            irqHeld <= (irqPulse or irqHeld) and not ctrl_quiet;
+         end if;
       end if;
    end process;
+
+   -- the engine's clock is mapped straight onto the port (no signal in between: no delta cycle against clk1x)
+   gctrl_sim : if SIM_FREEZE generate
+      ictrl : entity work.cd_ctrl
+      generic map (SIM_FREEZE => true)
+      port map
+      (
+         clk => clk_engine, ce => ce, reset => reset, hasCD => hasCD, region => region, SS_reset => SS_reset, SS_wren => SS_wren,
+         dma_read => dma_read,
+         beginCommand => beginCommand, newCmd => newCmd, CDROM_IRQFLAG => CDROM_IRQFLAG, ackRead_valid => ackRead_valid,
+         ackPendingIRQ => ackPendingIRQ, ackPendingSector => ackPendingSector, pendingDriveResponse => pendingDriveResponse,
+         FifoParam_Dout => FifoParam_Dout, FifoParam_Empty => FifoParam_Empty, FifoParam_Wr => FifoParam_Wr,
+         FifoResponse_Empty => FifoResponse_Empty,
+         newCD => newCD, isAudioCD => isAudioCD, trackcountBCD => trackcountBCD, totalMinutesBCD => totalMinutesBCD,
+         totalSecondsBCD => totalSecondsBCD, trackInfoA_lba => trackInfo_DataOutA(18 downto 0), minutesBCD => minutesBCD,
+         secondsBCD => secondsBCD, isAudio => isAudio, lastReadSector => lastReadSector, header => header, subheader => subheader,
+         headerIsData => headerIsData, headerDataSector => headerDataSector, nextSubdata => nextSubdata_v,
+         peakvolumeL => peakvolumeL, peakvolumeR => peakvolumeR, UpdateSubchannelDone => UpdateSubchannelDone,
+         fetchIdle => ctrl_fetchIdle, sectorFetchIdle => ctrl_sfetchIdle, bufferAhead => ctrl_bufAhead,
+         XA_reset => XA_reset, XA_start => XA_start,
+         FifoResponse_reset => FifoResponse_reset, FifoResponse_Wr => FifoResponse_Wr, FifoResponse_Din => FifoResponse_Din,
+         FifoParam_Rd => FifoParam_Rd, FifoParam_reset => FifoParam_reset, cmdPending => cmdPending, cmdAck => cmdAck,
+         cmdIRQ => cmdIRQ, driveAck => driveAck, getIDAck => getIDAck, softReset => softReset,
+         errorResponseNext_new => errorResponseNext_new, ackPendingIRQNext => ackPendingIRQNext, cdda_out8 => ctrl_cdda_out8,
+         ackDrive => ackDrive, ackDriveEnd => ackDriveEnd, ackRead => ackRead, internalStatus => internalStatus,
+         internalStatus_1 => internalStatus_1,
+         cmdResetXa => cmdResetXa, ClearXACurrentSet => ClearXACurrentSet, XaFilterFile => XaFilterFile,
+         XaFilterChannel => XaFilterChannel, muted => muted, cmd_busy => cmd_busy, working => working, driveBusy => driveBusy,
+         driveDelay => driveDelay, driveState => ctrl_driveState, modeReg => modeReg, currentLBA => currentLBA,
+         physicalLBA => physicalLBA, readLBA => readLBA, writeSectorPointer => writeSectorPointer,
+         readSectorPointer => readSectorPointer, readOnDisk => readOnDisk, seekOnDiskDrive => seekOnDiskDrive,
+         startReading => startReading, startPlaying => startPlaying, processDataSector => processDataSector,
+         processCDDASector => processCDDASector, processSeekHeader => processSeekHeader,
+         clearSectorBuffers => clearSectorBuffers, triggerUpdateSubchannel => triggerUpdateSubchannel,
+         handleDrive => handleDrive, newCD_1 => newCD_1,
+         eng_busy => eng_busy, quiet => ctrl_quiet
+      );
+   end generate;
+   gctrl : if not SIM_FREEZE generate
+      ictrl : entity work.cd_ctrl
+      generic map (SIM_FREEZE => false)
+      port map
+      (
+         clk => clk1x, ce => ce, reset => reset, hasCD => hasCD, region => region, SS_reset => SS_reset, SS_wren => SS_wren,
+         dma_read => dma_read,
+         beginCommand => beginCommand, newCmd => newCmd, CDROM_IRQFLAG => CDROM_IRQFLAG, ackRead_valid => ackRead_valid,
+         ackPendingIRQ => ackPendingIRQ, ackPendingSector => ackPendingSector, pendingDriveResponse => pendingDriveResponse,
+         FifoParam_Dout => FifoParam_Dout, FifoParam_Empty => FifoParam_Empty, FifoParam_Wr => FifoParam_Wr,
+         FifoResponse_Empty => FifoResponse_Empty,
+         newCD => newCD, isAudioCD => isAudioCD, trackcountBCD => trackcountBCD, totalMinutesBCD => totalMinutesBCD,
+         totalSecondsBCD => totalSecondsBCD, trackInfoA_lba => trackInfo_DataOutA(18 downto 0), minutesBCD => minutesBCD,
+         secondsBCD => secondsBCD, isAudio => isAudio, lastReadSector => lastReadSector, header => header, subheader => subheader,
+         headerIsData => headerIsData, headerDataSector => headerDataSector, nextSubdata => nextSubdata_v,
+         peakvolumeL => peakvolumeL, peakvolumeR => peakvolumeR, UpdateSubchannelDone => UpdateSubchannelDone,
+         fetchIdle => ctrl_fetchIdle, sectorFetchIdle => ctrl_sfetchIdle, bufferAhead => ctrl_bufAhead,
+         XA_reset => XA_reset, XA_start => XA_start,
+         FifoResponse_reset => FifoResponse_reset, FifoResponse_Wr => FifoResponse_Wr, FifoResponse_Din => FifoResponse_Din,
+         FifoParam_Rd => FifoParam_Rd, FifoParam_reset => FifoParam_reset, cmdPending => cmdPending, cmdAck => cmdAck,
+         cmdIRQ => cmdIRQ, driveAck => driveAck, getIDAck => getIDAck, softReset => softReset,
+         errorResponseNext_new => errorResponseNext_new, ackPendingIRQNext => ackPendingIRQNext, cdda_out8 => ctrl_cdda_out8,
+         ackDrive => ackDrive, ackDriveEnd => ackDriveEnd, ackRead => ackRead, internalStatus => internalStatus,
+         internalStatus_1 => internalStatus_1,
+         cmdResetXa => cmdResetXa, ClearXACurrentSet => ClearXACurrentSet, XaFilterFile => XaFilterFile,
+         XaFilterChannel => XaFilterChannel, muted => muted, cmd_busy => cmd_busy, working => working, driveBusy => driveBusy,
+         driveDelay => driveDelay, driveState => ctrl_driveState, modeReg => modeReg, currentLBA => currentLBA,
+         physicalLBA => physicalLBA, readLBA => readLBA, writeSectorPointer => writeSectorPointer,
+         readSectorPointer => readSectorPointer, readOnDisk => readOnDisk, seekOnDiskDrive => seekOnDiskDrive,
+         startReading => startReading, startPlaying => startPlaying, processDataSector => processDataSector,
+         processCDDASector => processCDDASector, processSeekHeader => processSeekHeader,
+         clearSectorBuffers => clearSectorBuffers, triggerUpdateSubchannel => triggerUpdateSubchannel,
+         handleDrive => handleDrive, newCD_1 => newCD_1,
+         eng_busy => eng_busy, quiet => ctrl_quiet
+      );
+   end generate;
+
    
    ififoResponse: entity mem.SyncFifoFallThrough
    generic map
@@ -1758,643 +1051,8 @@ begin
       ss_out(i + 76)(7 downto 0) <= subdata(i);
    end generate;
    
-   process (FORCECDSPEED, allow_speedhack, modeReg)
-   begin
-      if (FORCECDSPEED = "000" or allow_speedhack = '0') then
-         if (modeReg(7) = '1') then
-            driveREADSPEED <= READSPEED2X;
-         else
-            driveREADSPEED <= READSPEED1X;
-         end if;
-      else
-         case (FORCECDSPEED) is
-            when "010"   => driveREADSPEED <= READSPEED2X;
-            when "011"   => driveREADSPEED <= READSPEED4X;
-            when "100"   => driveREADSPEED <= READSPEED6X;
-            when "101"   => driveREADSPEED <= READSPEED8X;
-            when others =>  driveREADSPEED <= READSPEED1X;
-         end case;
-      end if;
-   end process;
 
    -- drive
-   process(clk1x)
-      variable skipreading     : std_logic;
-      variable physicalLBANew  : integer range 0 to 524287;
-      variable phy_spt_v       : integer range 8 to 22;															
-   begin
-      if (rising_edge(clk1x)) then
-
-         if (SS_reset = '1') then
-            startMotorReset        <= '1'; 
-         elsif (SS_wren = '1') then
-            startMotorReset        <= '0'; 
-            startMotor             <= '0';
-         end if;
-
-         if (reset = '1') then
-            
-            driveBusy               <= ss_in(18)(4); -- 0
-            driveState              <= tdrivestate'VAL(to_integer(unsigned(ss_in(15)(27 downto 24)))); -- DRIVE_IDLE;  
-            
-            driveDelay              <= to_integer(unsigned(ss_in(4)(26 downto 0))); -- 0
-            driveDelayNext          <= to_integer(unsigned(ss_in(5)(26 downto 0))); -- 0
-                     
-            internalStatus          <= ss_in(13)(7 downto 0); -- x"10"; -- shell open
-            modeReg                 <= ss_in(13)(15 downto 8); -- x"20"; -- read_raw_sector set
-                     
-            currentLBA              <= to_integer(unsigned(ss_in(3)(19 downto 0))); -- 0
-            physicalLBA             <= to_integer(unsigned(ss_in(7)(19 downto 0))); -- 0
-            
-            readAfterSeek           <= ss_in(18)(5); -- '0'
-            playAfterSeek           <= ss_in(18)(6); -- '0';
-            lastSectorHeaderValid   <= ss_in(18)(8); -- '0';
-            
-            writeSectorPointer      <= unsigned(ss_in(16)( 2 downto 0)); -- 0
-            readSectorPointer       <= unsigned(ss_in(16)(10 downto 8)); -- 0
-            
-            currentTrackBCD         <= ss_in(25)( 7 downto 0); -- 0
-            
-            for i in 0 to 11 loop
-               subdata(i) <= ss_in(i + 76)(7 downto 0);
-            end loop;
-            
-            startMotorReset <= '0';
-            if (startMotorReset = '1') then
-               startMotor <= '1';
-            end if;
-            
-            calcSeekTime  <= '0';
-            addSeekTime   <= '0';
-            
-            allow_speedhack <= '0';
-            Xa_playing      <= '0';
-            
-         elsif (softReset = '1') then
-         
-            modeReg        <= x"20"; -- read_raw_sector set
-            internalStatus <= x"00";
-            if (hasCD = '1') then
-               internalStatus(1) <= '1';
-               
-               if (currentLBA /= 0) then
-               	driveState <= DRIVE_SEEKIMPLICIT;
-                  --seekStartLBA = currentLBA; -- todo
-                  --seekEndLBA = 0;
-                  readOnDisk   <= '1';
-                  readLBA      <= 0;
-               else
-                  driveState <= DRIVE_SPEEDCHANGEORTOCREAD;
-               end if;
-               
-               driveBusy  <= '1';
-               if (modeReg(7) = '1') then -- double speed
-                  driveDelay     <= 16934400 + 33868800 + 19999;
-               else
-                  driveDelay     <= 16934400 + 19999;
-               end if;  
-
-               if (INSTANTSEEK = '0') then
-                  calcSeekTime   <= '1';   
-                  limitDelayTime <= '0';
-               end if;
-               diffLBA <= currentLBA;
-            
-            else
-               driveBusy  <= '0';
-               driveState <= DRIVE_IDLE;
-               driveDelay <= 0;
-            end if;
-            
-         elsif (ce = '1') then
-         
-            handleDrive             <= '0';
-            readOnDisk              <= '0';
-            ackDrive                <= '0';
-            ackDriveEnd             <= '0';
-            seekOnDiskDrive         <= '0';
-            seekOnDiskPlay          <= '0';
-            errorResponseDrive_new  <= '0';
-            startReading            <= '0';
-            startPlaying            <= '0';
-            ackRead                 <= '0';
-            processDataSector       <= '0';
-            processCDDASector       <= '0';
-            processSeekHeader       <= '0';
-            clearSectorBuffers      <= '0';
-            triggerUpdateSubchannel <= '0';
-            calcSeekTime            <= '0';
-            addSeekTime             <= '0';
-         
-            startMotor   <= '0'; 
-            
-            internalStatus_1 <= internalStatus;
-            
-            if ((driveState /= DRIVE_READING and startReading = '0') or XA_write = '1' or mdec_idle = '0') then
-               allow_speedhack <= '0';
-            end if;
-            
-            if (XA_reset = '1') then
-               Xa_playing <= '0';
-            elsif (XA_start = '1') then
-               Xa_playing <= '1';
-            end if;
-            
-            sectorBufferFilled <= '0';
-            if (driveState = DRIVE_READING and sectorBufferSizes(to_integer((writeSectorPointer + 4))) /= 0) then -- allow up to 4 buffers to be filled
-               sectorBufferFilled <= not Xa_playing;
-            end if;
-         
-            if (driveBusy = '1') then
-               if (driveDelay > 0) then
-                  if ((sectorBufferFilled = '0' and LIMITREADSPEED = '0') or CDROM_IRQFLAG = "00000" or driveDelay > 8191) then
-                     if (sectorFetchState = SFETCH_IDLE or driveDelay > 127) then -- make sure to stop drive countdown if data isn't ready early enough so commands are still possible
-                        driveDelay <= driveDelay - 1;
-                     end if;
-                  end if;
-               elsif (sectorFetchState = SFETCH_IDLE and readOnDisk = '0' and readOnDisk_buffer = '0' and sectorProcessState = SPROC_IDLE and copyState = COPY_IDLE) then
-                  handleDrive <= '1';
-                  driveBusy   <= '0';
-                  
-                  -- completeSeek
-                  if (driveState = DRIVE_SEEKIMPLICIT or driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL) then
-                     
-                     seekOK <= '1';
-                     
-                     for i in 0 to 11 loop
-                        subdata(i) <= nextSubdata(i);
-                     end loop;
-                     
-                     -- todo: check subdata against current frame/second/minute?
-                     
-                     if (nextSubdata(0)(6) = '1') then --isData
-                        if (driveState = DRIVE_SEEKLOGICAL) then
-                           processSeekHeader     <= '1';
-                           lastSectorHeaderValid <= '1';
-                        end if;
-                     else
-                        if (driveState = DRIVE_SEEKLOGICAL) then
-                           seekOK <= modeReg(0); -- cdda
-                        end if;
-                     end if;
-                     if (nextSubdata(1) = LEAD_OUT_TRACK_NUMBER) then
-                        seekOK <= '0';
-                     end if;
-                      
-                     currentLBA   <= lastReadSector;
-                     physicalLBA  <= lastReadSector;
-                      
-                  end if;
-                  
-               end if;
-            end if;
-            
-            if (handleDrive = '1') then
-               case (driveState) is
-               
-                  when DRIVE_SEEKIMPLICIT =>
-                     --todo
-                     
-                  when DRIVE_SEEKLOGICAL | DRIVE_SEEKPHYSICAL =>
-                     driveState     <= DRIVE_IDLE;
-                     internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                     if (seekOk = '1') then
-                        if (readAfterSeek = '1') then
-                           startReading      <= '1';
-                           allow_speedhack   <= '1';
-                           afterSeek         <= '1';
-                           readAfterSeek     <= '0';
-                           internalStatus(6) <= '1'; -- keep seek on until read is active
-                        elsif (playAfterSeek = '1') then
-                           startPlaying  <= '1';
-                           afterSeek     <= '1';
-                           playAfterSeek <= '0';
-                        else
-                           ackDrive <= '1';
-                        end if;
-                     else
-                        lastSectorHeaderValid     <= '0';
-                        errorResponseDrive_new    <= '1';
-                        errorResponseDrive_error  <= x"04";
-                        errorResponseDrive_reason <= x"04";
-                     end if;
-                     
-                     
-                  when DRIVE_READING | DRIVE_PLAYING =>
-                     if (nextSubdata(1) = LEAD_OUT_TRACK_NUMBER) then
-                        internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-						-- The motor should remain ON during normal CD audio playback. End-of-track detection should NOT stop the motor.
-                        -- always signal end of playback with interrupt
-                        -- internalStatus(1)          <= '0'; -- motor off
-                        driveState   <= DRIVE_IDLE;
-                        ackDriveEnd  <= '1';
-                     else
-                        skipreading := '0';
-                        if (isAudio = '1') then
-                           if (currentTrackBCD = x"00") then -- auto find track number from subheader
-                              currentTrackBCD <= nextSubdata(1);
-                           elsif (nextSubdata(1) /= currentTrackBCD and modeReg(1) = '1') then --auto pause when track switches
-                              skipreading := '1';
-                              ackDriveEnd <= '1';
-                              internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                              driveState   <= DRIVE_IDLE;
-                           end if;
-                        end if;   
-                        
-                        if (skipreading = '0') then
-                           readLBA      <= lastReadSector + 1;
-                           if (isAudio = '0' and driveState = DRIVE_READING) then
-                              processDataSector     <= '1';
-                              lastSectorHeaderValid <= '1';
-                              internalStatus(5)     <= '1'; -- reading
-                              internalStatus(6)     <= '0'; -- seek off
-                              if ((modeReg(6) = '0' or headerIsData = '1') and (modeReg(5) = '1' or headerDataSector = '1')) then
-                                 writeSectorPointer    <= writeSectorPointer + 1;
-                                 ackRead               <= '1';
-                              end if;
-                           elsif (isAudio = '1' and (driveState = DRIVE_PLAYING or (driveState = DRIVE_READING and modeReg(0) = '1'))) then
-                              if (CDDA_ON) then processCDDASector <= '1'; end if;
-                              if (fastForwardRate /= 0) then
-                                 readLBA <= lastReadSector + to_integer(fastForwardRate);
-                              end if;
-                           end if;
-                           
-                           if (fastCD = '1') then
-                              driveDelay      <= 9999 - 2;
-                           else
-                              driveDelay      <= driveREADSPEED - 2;
-                           end if;
-                           
-                           driveBusy    <= '1';
-                           currentLBA   <= lastReadSector;
-                           physicalLBA  <= lastReadSector;
-                           for i in 0 to 11 loop
-                              subdata(i) <= nextSubdata(i);
-                           end loop;
-                           readOnDisk   <= '1';
-                        end if;
-                     end if;
-                     
-                  when DRIVE_SPEEDCHANGEORTOCREAD =>
-                     driveState     <= DRIVE_IDLE;
-               
-                  when DRIVE_SPINNINGUP =>
-                     driveState     <= DRIVE_IDLE;
-                     internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                     if (hasCD = '1') then
-                        internalStatus(1) <= '1';
-                     end if;
-                  
-                  when DRIVE_CHANGESESSION =>
-                     driveState     <= DRIVE_IDLE;
-                     internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                     if (hasCD = '1') then
-                        internalStatus(1) <= '1';
-                     end if;
-                     if (session = x"01") then --todo: multisession
-                        ackDrive <= '1';
-                     end if;
-                     
-                  when DRIVE_OPENING =>
-                     startMotor <= '1';
-                  
-                  when others => null;
-               end case;
-            end if;
-            
-            seekLBA <= to_integer(setLocMinute) * FRAMES_PER_MINUTE + to_integer(setLocSecond) * FRAMES_PER_SECOND + to_integer(setLocFrame);
-            
-            if (seekOnDiskCmd = '1' or seekOnDiskDrive = '1' or seekOnDiskPlay = '1') then
-               if (seekOnDiskPlay = '1') then
-                  readLBA <= playLBA;
-                  if (playLBA > currentLBA) then diffLBA <= playLBA - currentLBA; else diffLBA <= currentLBA - playLBA; end if;
-               else
-                  readLBA <= seekLBA;
-                  if (seekLBA > currentLBA) then diffLBA <= seekLBA - currentLBA; else diffLBA <= currentLBA - seekLBA; end if;
-               end if;
-               readOnDisk            <= '1';
-               if (seekOnDiskCmd = '1') then
-                  readAfterSeek         <= '0';
-                  playAfterSeek         <= '0';
-               end if;
-               lastSectorHeaderValid      <= '0';
-               internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-               internalStatus(1)          <= '1'; -- motor on
-               internalStatus(6)          <= '1'; -- seeking
-               driveDelay                 <= driveREADSPEED - 2;
-               driveDelayNext             <= driveREADSPEED - 2;
-               
-               limitDelayTime             <= '0';
-
-               if (INSTANTSEEK = '0') then
-                  calcSeekTime <= '1';
-                  if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                     driveDelay     <= driveREADSPEED - 2 + driveDelay;
-                     limitDelayTime <= '1';
-                  elsif (driveState = DRIVE_SPEEDCHANGEORTOCREAD and (seekOnDiskPlay = '0' and playAfterSeek = '0')) then
-                     driveDelay <= driveREADSPEED - 2 + driveDelay;
-                  end if; 
-               end if;
-               
-               driveBusy      <= '1';
-               if (nextCmd = x"15") then
-                  driveState  <= DRIVE_SEEKLOGICAL;
-               else
-                  driveState  <= DRIVE_SEEKPHYSICAL;
-               end if;
-            end if;    
-            
-            if (stop_afterseek = '1') then
-               readAfterSeek <= '0';
-               playAfterSeek <= '0';
-            end if;
-            
-            if (calcSeekTime = '1') then
-            
-               addSeekTime <= '1';
-               
-               -- todo: research more accurate values
-               if (diffLBA < 3) then
-                  seekTimeMul <= 3;
-               elsif (diffLBA < 5) then
-                  seekTimeMul <= diffLBA;
-               elsif (diffLBA < 32) then
-                  seekTimeMul <= 5;
-               elsif (diffLBA < 75) then
-                  seekTimeMul <= 5 + diffLBA / 8; -- 5 .. 14
-               elsif (diffLBA < 4500) then
-                  seekTimeMul <= 14 + diffLBA / 256; -- 14 .. 31
-            
-               elsif (diffLBA < 250000) then
-                  seekTimeMul <= 31 + diffLBA / 8192; -- 31 .. 73            
-               else
-                  -- extreme sled seek only when starting from inner position after Stop
-                  if (currentLBA = 0) then
-                     seekTimeMul <= 137;
-                  else
-                     seekTimeMul <= 31 + diffLBA / 8192;
-                  end if;
-               end if;
-			   
-            end if;
-            
-            if (addSeekTime = '1') then
-               if (limitDelayTime = '1' and (driveDelay + driveREADSPEED * seekTimeMul) > 22880000) then -- max seek time
-                  driveDelay <= 22880000;
-               else
-                  driveDelay <= driveDelay + driveREADSPEED * seekTimeMul;
-               end if;
-            end if;
-            
-            if (readSN = '1') then
-               if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                  -- todo: updatePositionWhileSeeking();
-               end if;
-               if (setLocActive = '1') then
-                  seekOnDiskDrive   <= '1';
-                  readAfterSeek     <= '1';
-                  playAfterSeek     <= '0';
-               else
-                  internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                  startReading      <= '1';
-                  allow_speedhack   <= '1';
-                  afterSeek         <= '0';
-               end if;
-            end if;
-            
-            if (play = '1') then
-               if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                  -- todo: updatePositionWhileSeeking();
-               end if;
-               currentTrackBCD <= nextTrack;
-               if (playTrack = '1') then
-                  seekOnDiskPlay    <= '1';
-                  readAfterSeek     <= '0';
-                  playAfterSeek     <= '1';
-               elsif (setLocActive = '1') then
-                  seekOnDiskDrive   <= '1';
-                  readAfterSeek     <= '0';
-                  playAfterSeek     <= '1';
-               else
-                  startPlaying <= '1';
-                  afterSeek    <= '0';
-               end if;
-            end if;
-            
-            if (setSession = '1') then
-               driveState     <= DRIVE_CHANGESESSION;
-               driveBusy      <= '1';
-               driveDelay     <= 33868800 / 2;
-            end if; 
-            
-            if (startReading = '1') then
-               clearSectorBuffers <= '1';
-			   
-			   if (afterSeek = '0') then
-			      internalStatus(6) <= '1';  -- seeking until first sector arrives
-			   end if;
-															
-               --todo: check for setLocActive needed when coming from readSN?
-               if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                  readAfterSeek     <= '1';
-                  playAfterSeek     <= '0';
-               else
-                  internalStatus(1)          <= '1'; -- motor on
-                  if (fastCD = '1') then
-                     driveDelay         <= 9999 - 2;
-                     driveDelayNext     <= 9999 - 2;
-                  else
-                     driveDelay      <= driveREADSPEED - 2;
-                     driveDelayNext  <= driveREADSPEED - 2;
-                  end if;
-                  driveBusy          <= '1';
-                  driveState         <= DRIVE_READING;
-                  writeSectorPointer <= (others => '0');
-                  readSectorPointer  <= (others => '0');
-                  readOnDisk         <= '1';
-                  readLBA            <= currentLBA;
-                  seekTimeMul        <= 1;
-                  if (INSTANTSEEK = '0' and afterSeek = '0') then
-                     if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                        driveDelay <= driveREADSPEED - 2 + driveDelay;
-                     elsif (driveState = DRIVE_SPEEDCHANGEORTOCREAD) then
-                        driveDelay  <= driveREADSPEED - 2 + driveDelay;
-                     end if;
-                     addSeekTime    <= '1';
-                     limitDelayTime <= '0';
-                  end if;
-               end if;
-            end if;
-            
-            if (startPlaying = '1') then
-               clearSectorBuffers <= '1';
-               --todo: check for setLocActive needed when coming from readSN?
-               if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                  readAfterSeek     <= '0';
-                  playAfterSeek     <= '1';
-               else
-                  internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-                  internalStatus(1)          <= '1'; -- motor on
-                  internalStatus(7)          <= '1'; -- playing_cdda
-                  if (fastCD = '1') then
-                     driveDelay         <= 9999 - 2;
-                     driveDelayNext     <= 9999 - 2;
-                  else
-                     driveDelay      <= driveREADSPEED - 2;
-                     driveDelayNext  <= driveREADSPEED - 2;
-                  end if;
-                  driveBusy          <= '1';
-                  driveState         <= DRIVE_PLAYING;
-                  writeSectorPointer <= (others => '0');
-                  readSectorPointer  <= (others => '0');
-                  readOnDisk         <= '1';
-                  readLBA            <= currentLBA;
-                  seekTimeMul        <= 1;
-                  if (INSTANTSEEK = '0' and afterSeek = '0') then
-                     if (driveState = DRIVE_SEEKLOGICAL or driveState = DRIVE_SEEKPHYSICAL or driveState = DRIVE_SEEKIMPLICIT) then
-                        driveDelay <= driveREADSPEED - 2 + driveDelay;
-                     end if;
-                     addSeekTime    <= '1';
-                     limitDelayTime <= '0';
-                  end if;
-               end if;
-            end if;
-            
-            if (cmdStop = '1') then
-               lastSectorHeaderValid      <= '0';
-               driveState                 <= DRIVE_IDLE;
-               driveBusy                  <= '0';
-               internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-               internalStatus(1)          <= '0';   --motor off
-			   currentLBA                 <= 0;
-            end if;
-            
-            if (drive_stop = '1') then
-               driveState <= DRIVE_IDLE;
-               driveBusy  <= '0';
-               internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-            end if;
-            
-            if (startMotor = '1' or cmdStartMotor = '1') then
-               if (driveState /= DRIVE_SPINNINGUP) then
-                  driveState     <= DRIVE_SPINNINGUP;
-                  driveDelay     <= 44100*300;
-                  driveDelayNext <= 44100*300;
-                  driveBusy      <= '1';
-               end if;
-            end if;
-            
-            if (LIDopen = '1') then
-               internalStatus(4) <= '1';
-            elsif (shell_close = '1') then
-               internalStatus(4) <= '0';
-            end if;
-            
-            if (ackRead_valid = '1' or ackPendingSector = '1') then
-               readSectorPointer <= readSectorPointer + 1;
-            end if;
-            
-            if (startMotorCMD = '1') then
-               internalStatus(1) <= '1'; -- motor on
-            end if;
-            
-            if (setMode = '1') then
-               modeReg <= newMode;
-               if (modeReg(7) /= newMode(7)) then -- speedchange
-                  if (driveState = DRIVE_SPEEDCHANGEORTOCREAD) then
-                     -- todo: need to early finish here?
-                  elsif (driveState /= DRIVE_SEEKIMPLICIT) then
-                     -- todo: add time? for now just set new time, it's very long anyway
-                     if (newMode(7) = '1') then
-                        driveDelay     <= 27095040; -- 80%
-                     else
-                        driveDelay     <= 33868800; -- 44100 * 0x300; -- 100%
-                     end if;
-                     if (driveState = DRIVE_IDLE) then
-                        driveState <= DRIVE_SPEEDCHANGEORTOCREAD;
-                        driveBusy  <= '1';
-                     end if;
-                  end if;
-               end if;
-            end if;
-            
-            -- updatePhysicalPosition triggered from GetLocP only - todo: trigger constantly when motor on and not seeking/reading?
-            case (physicalUpdateState) is
-            
-               when PHYSICALUPDATE_IDLE =>
-                  if (updatePhysicalPosition = '1') then
-                     physicalUpdateState <= PHYSICALUPDATE_START;
-                  end if;
-            
-            when PHYSICALUPDATE_START =>
-               physicalUpdateState <= PHYSICALUPDATE_CHECK;
-
-               -- rama PSX mech SPT table
-               phy_spt_v := getSectorsPerTrack(currentLBA);
-               phy_spt   <= phy_spt_v;
-
-               if (currentLBA < phy_spt_v) then
-                  phy_base <= currentLBA;
-               else
-                  phy_base <= currentLBA - (phy_spt_v - 1);
-               end if;
-                  
-               when PHYSICALUPDATE_CHECK =>
-                  physicalUpdateState <= PHYSICALUPDATE_CALC1;
-                  if (physicalLBA < phy_base) then
-                     physicalLBA <= phy_base;
-                  end if;
-                  
-               when PHYSICALUPDATE_CALC1 =>
-                  physicalUpdateState <= PHYSICALUPDATE_CALC2;
-                  phy_oldOffset <= physicalLBA - phy_base;
-                  
-               when PHYSICALUPDATE_CALC2 =>  
-                  physicalUpdateState <= PHYSICALUPDATE_CALCDONE;
-                  phy_newOffset <= modSmall(phy_oldOffset + 1, phy_spt);
-            
-               when PHYSICALUPDATE_CALCDONE =>
-                  physicalLBANew := phy_base + phy_newOffset;
-                  physicalLBA    <= physicalLBANew; 
-                  if (physicalLBA /= physicalLBANew) then
-                     physicalUpdateState     <= PHYSICALUPDATE_READSUBCHANNEL;
-                     triggerUpdateSubchannel <= '1';
-                  else
-                     physicalUpdateState     <= PHYSICALUPDATE_IDLE;
-                  end if;
-            
-               when PHYSICALUPDATE_READSUBCHANNEL =>
-                  if (UpdateSubchannelDone = '1') then
-                     physicalUpdateState     <= PHYSICALUPDATE_IDLE;
-                     for i in 0 to 11 loop
-                        subdata(i) <= nextSubdata(i);
-                     end loop;
-                  end if;
-            
-            end case;
-            
-            newCD_1 <= newCD;
-            if (newCD = '1' and newCD_1 = '0') then
-               driveState                 <= DRIVE_OPENING;
-               driveBusy                  <= '1';
-               if (modeReg(7) = '1') then
-                  driveDelay              <= 25000000;
-               else
-                  driveDelay              <= 13000000;
-               end if;
-               internalStatus(7 downto 5) <= "000"; -- ClearActiveBits
-               internalStatus(1)          <= '0';   -- motor off
-               internalStatus(4)          <= '1';   -- open LID
-               errorResponseDrive_new     <= '1';
-               errorResponseDrive_error   <= x"01";
-               errorResponseDrive_reason  <= x"08";
-            end if;
-            
-            --modeReg(1) <= '0'; -- debug autopause
-            
-         end if; -- ce
-      end if;
-   end process;
    
    iramSectorBuffer: entity mem.dpram
    generic map 

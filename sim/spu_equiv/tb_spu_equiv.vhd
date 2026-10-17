@@ -240,7 +240,9 @@ begin
          -- ce stays 1: it only drops while the whole system is paused (a one-cycle RAM done is not
          -- held across a ce=0 cycle in the original either)
          if (rnd(2000) = 0) then cpuPaused <= not cpuPaused; end if;
-         if (rnd(64) = 0) then cd_left <= signed(rnd16); cd_right <= signed(rnd16); end if;
+         -- CD input: a new sample right after each SPU tick, as cd_top's mix updates it (the SPU queues it 16 clocks
+         -- after the tick; changes at other times are not something the real core does)
+         if (o_ref.spu_tick = '1') then cd_left <= signed(rnd16); cd_right <= signed(rnd16); end if;
 
          -- occasional reset sequence like the system's: reset with SS_reset, then the savestate
          -- module writes zeros to the module's state words

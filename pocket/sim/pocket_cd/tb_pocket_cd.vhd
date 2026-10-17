@@ -1,7 +1,11 @@
 -- Testbench for pocket/src/fpga/core/pocket_cd.vhd
 --  * APF side model: data slot table (datatable, 2 clocks latency, entries in any order) and the target command
 --    "data slot read" (as core_bridge_cmd + APF behave: done cleared when the command starts, data written to the
---    bridge address as 32-bit words with gaps, done set at the end)
+--    bridge address as 32-bit words with gaps, done set at the end), any multiple of 2352 bytes into the sector ring;
+--    LAT = 1: an SD card on a bad day: 2..8 ms before the data of each command, one in ten 10..30 ms;
+--    LAT = 2: worse: 5..12 ms (more than a sector period on average), one in ten 15..40 ms
+--  * NSTREAM > 0: then NSTREAM sectors read in order at double speed (one per 6.67 ms, as the drive asks; a late one
+--    delays the rest, as the drive waits): sectors late and the total wait are reported
 --  * core side model (clk1x): reset until cd_ready, trackinfo capture, sector requests like cd_top.vhd
 --    (req + lba, req dropped when ack is seen, 16-bit words counted on cd_hps_write until ack falls)
 -- Checks: trackinfo words against MiSTer psx.cpp's layout, every 16-bit word of every requested sector.
@@ -16,7 +20,13 @@ entity tb_pocket_cd is
       NUM_REQ  : integer := 60;
       SEED     : integer := 1;
       LAYOUT   : integer := 0;     -- 0: SotN (2 tracks), 1: 5 tracks, 2: no disc, 3: audio CD (track 1 in slot 15)
-      MUTATION : integer := 0      -- testbench self check: 1 = expect the wrong file offset
+      MUTATION : integer := 0;     -- testbench self check: 1 = expect the wrong file offset
+      LAT      : integer := 0;     -- APF read time: 0 fast (us), 1 slow SD (ms, with spikes), 2 slower
+      NSTREAM  : integer := 0;     -- sectors of the double speed stream after the random requests
+      STREAM0  : integer := 20000; -- its first LBA (< 0: that many sectors before track 2, the stream crosses into it)
+      SLOT_BITS : integer := 3;    -- pocket_cd's ring (generics)
+      KMAX     : integer := 4;
+      BUF_AW   : integer := 13
    );
 end entity;
 
@@ -57,6 +67,7 @@ architecture sim of tb_pocket_cd is
    signal ti_count  : integer := 0;
 
    signal done_sim  : boolean := false;
+   signal cmds      : integer := 0;   -- data slot read commands
 
    function sectors(layout : integer) return tInt is
    begin
@@ -118,7 +129,7 @@ begin
    clk1x   <= not clk1x   after 14763 ps when not done_sim;
 
    idut : entity work.pocket_cd
-   generic map (TRACK_ID_BASE => TRACK_ID_BASE, MAX_TRACKS => 24)
+   generic map (TRACK_ID_BASE => TRACK_ID_BASE, MAX_TRACKS => 24, SLOT_BITS => SLOT_BITS, KMAX => KMAX, BUF_AW => BUF_AW)
    port map
    (
       clk_74a => clk_74a, reset_n_74a => reset_n, cd_ready => cd_ready, has_cd => has_cd,
@@ -171,8 +182,11 @@ begin
          id   := to_integer(unsigned(dsr_id));
          offs := to_integer(unsigned(dsr_offset));
          len  := to_integer(unsigned(dsr_length));
-         assert dsr_bridgeaddr = x"40000000" report "bridge address" severity failure;
-         assert len = 2352 report "length" severity failure;
+         assert unsigned(dsr_bridgeaddr) >= x"40000000" and (to_integer(unsigned(dsr_bridgeaddr(27 downto 0))) mod 2352) = 0
+                report "bridge address " & to_hstring(dsr_bridgeaddr) severity failure;
+         assert len > 0 and len mod 2352 = 0 and to_integer(unsigned(dsr_bridgeaddr(27 downto 0))) + len <= 4 * 2 ** BUF_AW
+                report "length " & integer'image(len) & " at " & to_hstring(dsr_bridgeaddr) severity failure;
+         cmds <= cmds + 1;
          t := -1;
          for i in 0 to NT - 1 loop
             if (slot(i) = id) then t := i; end if;
@@ -183,9 +197,18 @@ begin
          wait until rising_edge(clk_74a);
          dsr_done <= '0';
          uniform(rnd_s1, rnd_s2, u);
-         for i in 0 to 50 + integer(u * 400.0) loop wait until rising_edge(clk_74a); end loop;
+         if (LAT = 0) then
+            for i in 0 to 50 + integer(u * 400.0) loop wait until rising_edge(clk_74a); end loop;
+         else
+            if (LAT = 1) then
+               if (u < 0.1) then wait for 10 ms + u * 200 ms; else wait for 2 ms + (u - 0.1) * 6.67 ms; end if;
+            else
+               if (u < 0.1) then wait for 15 ms + u * 250 ms; else wait for 5 ms + (u - 0.1) * 7.78 ms; end if;
+            end if;
+            wait until rising_edge(clk_74a);
+         end if;
          for w in 0 to len / 4 - 1 loop
-            bridge_addr    <= std_logic_vector(to_unsigned(16#40000000# + 4 * w, 32));
+            bridge_addr    <= std_logic_vector(to_unsigned(to_integer(unsigned(dsr_bridgeaddr)) + 4 * w, 32));
             bridge_wr_data <= fileword(id, offs + 4 * w);
             bridge_wr      <= '1';
             wait until rising_edge(clk_74a);
@@ -228,6 +251,8 @@ begin
       variable total    : integer;
       variable exp_ti   : integer;
       variable ti_err   : integer := 0;
+      variable c0, late : integer := 0;
+      variable tnext, treq, stall, maxwait : time := 0 ns;
 
       procedure check_ti(a : integer; v : integer) is
       begin
@@ -332,7 +357,55 @@ begin
       end loop;
 
       report "DONE requests=" & integer'image(NUM_REQ) & " slot_reads=" & integer'image(reads) & " zero_sectors=" &
-             integer'image(zeroes) & " word_errors=" & integer'image(errors) & " trackinfo_errors=" & integer'image(ti_err);
+             integer'image(zeroes) & " word_errors=" & integer'image(errors) & " trackinfo_errors=" & integer'image(ti_err) &
+             " commands=" & integer'image(cmds);
+
+      ---------------- double speed stream: sector i asked for at max(T0 + i * 6.667 ms, when sector i - 1 was in)
+      if (NSTREAM > 0 and LAYOUT /= 2) then
+         c0 := cmds;
+         tnext := now;
+         for i in 0 to NSTREAM - 1 loop
+            if (STREAM0 < 0) then l := first_lba(1) + STREAM0 + i; else l := STREAM0 + i; end if;
+            if (now < tnext) then wait for tnext - now; end if;
+            wait until rising_edge(clk1x);
+            treq := now;
+            lba <= std_logic_vector(to_unsigned(l, 32));
+            req <= '1';
+            ack_seen := false;
+            nwords   := 0;
+            loop
+               wait until rising_edge(clk1x);
+               if (ack = '1' and not ack_seen) then
+                  ack_seen := true;
+                  req      <= '0';
+               elsif (ack_seen) then
+                  if (wr = '1') then
+                     t := 0;
+                     for k in 0 to NT - 1 loop
+                        if (l >= first_lba(k)) then t := k; end if;
+                     end loop;
+                     o := (l - first_lba(t)) * 2352 + (nwords / 2) * 4;
+                     expw := fileword(slot(t), o);
+                     if (nwords mod 2 = 0) then exph := expw(15 downto 0); else exph := expw(31 downto 16); end if;
+                     if (data /= exph) then errors := errors + 1; end if;
+                     nwords := nwords + 1;
+                  end if;
+                  exit when ack = '0';
+               end if;
+            end loop;
+            -- the drive needs the sector before its next one is due (period minus the ~4 us its countdown keeps)
+            if (now - treq > 6662 us) then
+               late := late + 1;
+               stall := stall + (now - treq - 6662 us);
+            end if;
+            if (now - treq > maxwait) then maxwait := now - treq; end if;
+            tnext := treq + 6667 us;
+            if (now > tnext) then tnext := now; end if;
+         end loop;
+         report "STREAM sectors=" & integer'image(NSTREAM) & " late=" & integer'image(late) & " total_wait=" &
+                time'image(stall) & " max_request_to_data=" & time'image(maxwait) & " commands=" &
+                integer'image(cmds - c0) & " word_errors=" & integer'image(errors);
+      end if;
       if (errors = 0 and ti_err = 0) then report "PASS"; else report "FAIL"; end if;
       done_sim <= true;
       wait;

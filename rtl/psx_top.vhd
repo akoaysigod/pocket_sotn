@@ -214,6 +214,8 @@ entity psx_top is
       -- sound                            
       sound_out_left        : out std_logic_vector(15 downto 0) := (others => '0');
       sound_out_right       : out std_logic_vector(15 downto 0) := (others => '0');
+      sound_tick            : out std_logic := '0';   -- SPU sample tick (44.1 kHz)
+      sound_valid           : out std_logic := '0';   -- SPU: sound_out holds a newly finished sample (late if the SPU is)
       -- Pocket bring-up: PC, SR, last exception EPC/CAUSE, counts, POST code, last I/O address (see end of file)
       debug_out             : out std_logic_vector(255 downto 0) := (others => '0');
        -- savestates
@@ -540,6 +542,10 @@ architecture arch of psx_top is
 
    -- overlay + error codes
    signal cdSlow                 : std_logic;
+   signal spuLate                : std_logic;
+   signal spuSlow                : std_logic := '0';   -- Pocket test builds: an SPU sample started late (0.5 s, "SP")
+   signal spuSlowTimer           : unsigned(23 downto 0) := (others => '0');
+   signal spuslowEna             : std_logic;
    signal cdslowEna              : std_logic;
    signal errorEna               : std_logic;
    signal errorCode              : unsigned(3 downto 0) := (others => '0');
@@ -1476,6 +1482,22 @@ begin
 
    cdslowEna <= cdSlow and cdslowOn;
 
+   -- "SP" marker (with cdslowOn): an SPU sample started late, shown for ~0.5 s like the CD one
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (spuLate = '1') then
+            spuSlowTimer <= (others => '1');
+            spuSlow      <= '1';
+         elsif (spuSlowTimer > 0) then
+            spuSlowTimer <= spuSlowTimer - 1;
+         else
+            spuSlow <= '0';
+         end if;
+      end if;
+   end process;
+   spuslowEna <= spuSlow and cdslowOn;
+
    igpu : entity work.gpu
    port map
    (
@@ -1527,6 +1549,7 @@ begin
       Gun2IRQ10            => Gun2IRQ10,
 
       cdSlow               => cdslowEna,
+      spuSlow              => spuslowEna,
       
       errorOn              => errorOn,  
       errorEna             => errorEna, 
@@ -1675,6 +1698,8 @@ begin
       
       sound_out_left       => sound_out_left, 
       sound_out_right      => sound_out_right,
+      sound_valid          => sound_valid,
+      late                 => spuLate,
       
       bus_addr             => bus_spu_addr,     
       bus_dataWrite        => bus_spu_dataWrite,
@@ -2348,7 +2373,9 @@ begin
    gnoprof : if not POCKET_PROFILE generate
       debug_out(223 downto 0) <= (others => '0');
    end generate;
-   debug_out(255 downto 224) <= std_logic_vector(dbg_pc);                                        -- CPU PC
+   debug_out(255 downto 224) <= std_logic_vector(dbg_pc);
+
+   sound_tick <= spu_tick;                                        -- CPU PC
 
 end architecture;
 

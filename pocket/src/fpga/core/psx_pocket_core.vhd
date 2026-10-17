@@ -102,6 +102,8 @@ entity psx_pocket_core is
       KeyL3 : in std_logic;
       sound_out_left : out std_logic_vector(15 downto 0);
       sound_out_right : out std_logic_vector(15 downto 0);
+      sound_tick : out std_logic;
+      sound_valid : out std_logic;
       debug_out : out std_logic_vector(255 downto 0)
    );
 end entity;
@@ -159,7 +161,7 @@ begin
       rotate180 => '0',
       fixedVBlank => '0',
       vCrop => "00",
-      hCrop => '0',
+      hCrop => '1',   -- black past the mode's width (256 / 320 / 368 / 512 / 640 = the scaler slot's width)
       SPUon => '1',
       SPUIRQTrigger => '0',
       SPUSDRAM => '1',
@@ -350,6 +352,8 @@ begin
       beginTransferSnac => open,
       sound_out_left => sound_out_left,
       sound_out_right => sound_out_right,
+      sound_tick => sound_tick,
+      sound_valid => sound_valid,
       debug_out => debug_out,
       increaseSSHeaderCount => '0',
       save_state => '0',

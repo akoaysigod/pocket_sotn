@@ -260,6 +260,8 @@ entity psx_mister is
       -- sound                          
       sound_out_left        : out std_logic_vector(15 downto 0) := (others => '0');
       sound_out_right       : out std_logic_vector(15 downto 0) := (others => '0');
+      sound_tick            : out std_logic;   -- SPU sample tick (see psx_top)
+      sound_valid           : out std_logic;   -- SPU: a newly finished sample (see psx_top)
       debug_out             : out std_logic_vector(255 downto 0);   -- Pocket bring-up (see psx_top)
       -- savestates
       increaseSSHeaderCount : in  std_logic;
@@ -638,6 +640,8 @@ begin
       -- sound              => -- sound       
       sound_out_left        => sound_out_left, 
       sound_out_right       => sound_out_right,
+      sound_tick            => sound_tick,
+      sound_valid           => sound_valid,
       debug_out             => debug_out,
       -- savestates         
       increaseSSHeaderCount => increaseSSHeaderCount,

@@ -43,6 +43,7 @@ entity gpu_videoout is
       Gun2IRQ10                  : out std_logic;
             
       cdSlow                     : in  std_logic;
+      spuSlow                    : in  std_logic := '0';
             
       errorOn                    : in  std_logic;
       errorEna                   : in  std_logic;
@@ -133,6 +134,8 @@ architecture arch of gpu_videoout is
    
    signal overlay_cd_data     : std_logic_vector(23 downto 0);
    signal overlay_cd_ena      : std_logic;
+   signal overlay_sp_data     : std_logic_vector(23 downto 0);
+   signal overlay_sp_ena      : std_logic;
    
    signal errortext           : unsigned(7 downto 0);
    signal overlay_error_data  : std_logic_vector(23 downto 0);
@@ -430,6 +433,29 @@ begin
       textstring             => x"4344"
    );
    
+   -- Pocket test builds: "SP" next to "CD" while an SPU sample started late (psx_top)
+   ioverlaySP : entity work.gpu_overlay
+   generic map
+   (
+      COLS                   => 2,
+      BACKGROUNDON           => '1',
+      RGB_BACK               => x"FFFFFF",
+      RGB_FRONT              => x"0000FF",
+      OFFSETX                => 24,
+      OFFSETY                => 24
+   )
+   port map
+   (
+      clk                    => clkvid,
+      ce                     => videoout_out.ce,
+      ena                    => spuSlow,                    
+      i_pixel_out_x          => videoout_request_clkvid.xpos,
+      i_pixel_out_y          => to_integer(videoout_request_clkvid.lineDisp),
+      o_pixel_out_data       => overlay_sp_data,
+      o_pixel_out_ena        => overlay_sp_ena,
+      textstring             => x"5350"
+   );
+   
    errortext <= resize(errorCode, 8) + 16#30# when (errorCode < 10) else resize(errorCode, 8) + 16#37#;
    ioverlayError : entity work.gpu_overlay
    generic map
@@ -587,11 +613,12 @@ begin
       out_irq10      => Gun2IRQ10
    );
 
-   overlay_ena <= overlay_error_ena or overlay_lba_ena or overlay_cd_ena or overlay_fps_ena or debugtextDbg_ena or (overlay_Gun1_ena and Gun1CrosshairOn) or (overlay_Gun2_ena and Gun2CrosshairOn);
+   overlay_ena <= overlay_error_ena or overlay_lba_ena or overlay_cd_ena or overlay_sp_ena or overlay_fps_ena or debugtextDbg_ena or (overlay_Gun1_ena and Gun1CrosshairOn) or (overlay_Gun2_ena and Gun2CrosshairOn);
    
    overlay_data <= overlay_error_data when (overlay_error_ena = '1') else
                    overlay_lba_data   when (overlay_lba_ena = '1') else
                    overlay_cd_data    when (overlay_cd_ena = '1') else
+                   overlay_sp_data    when (overlay_sp_ena = '1') else
                    overlay_fps_data   when (overlay_fps_ena = '1') else
                    debugtextDbg_data  when (debugtextDbg_ena = '1') else
                    x"0000FF"          when (overlay_Gun1_ena = '1' and Gun1CrosshairOn = '1') else

@@ -690,6 +690,7 @@ pocket_psx ipsx (
     .video_vs         ( video_vs ),
     .video_hs         ( video_hs ),
 
+    .audio_lrck       ( audio_lrck ),
     .sound_left       ( sound_left ),
     .sound_right      ( sound_right )
 );
@@ -698,7 +699,8 @@ assign video_rgb_clock    = clkpix;
 assign video_rgb_clock_90 = clkpix_90;
 
 ////////////////////////////////////////////////////////////////////////////////////////
-// audio: PSX 44.1 kHz samples (signed 16 bit, clk1x) to the Pocket's 48 kHz I2S
+// audio: 48 kHz samples (signed 16 bit, clk1x; pocket_audio48 in pocket_psx interpolates the PSX's 44.1 kHz
+// output at the frames of this word clock) to the Pocket's I2S
 
 sound_i2s #(
     .CHANNEL_WIDTH ( 16 ),
